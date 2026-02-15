@@ -252,7 +252,8 @@ def is_variable_frame_rate(video_path):
         return False
 
 def run_ffmpeg_with_progress(command, total_duration, desc="Processing"):
-    """Runs an FFmpeg command and shows a tqdm progress bar based on stderr output."""
+    """Runs an FFmpeg command and shows a tqdm progress bar based on stderr output.
+    Returns (returncode, stderr_text) so callers can print errors."""
     from tqdm import tqdm
     import re
     process = subprocess.Popen(
@@ -262,7 +263,9 @@ def run_ffmpeg_with_progress(command, total_duration, desc="Processing"):
     pbar = tqdm(total=int(total_duration), desc=desc, unit="s", bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt}s [{elapsed}<{remaining}]')
     time_pattern = re.compile(r'time=(\d+):(\d+):(\d+)\.(\d+)')
     last_seconds = 0
+    stderr_lines = []
     for line in process.stderr:
+        stderr_lines.append(line)
         match = time_pattern.search(line)
         if match:
             h, m, s, _ = match.groups()
@@ -270,10 +273,10 @@ def run_ffmpeg_with_progress(command, total_duration, desc="Processing"):
             if current_seconds > last_seconds:
                 pbar.update(current_seconds - last_seconds)
                 last_seconds = current_seconds
-    pbar.update(int(total_duration) - last_seconds)
+    pbar.update(max(0, int(total_duration) - last_seconds))
     pbar.close()
     process.wait()
-    return process.returncode
+    return process.returncode, ''.join(stderr_lines)
 
 def normalize_to_cfr(video_path, output_path, total_duration=0):
     """Re-muxes a VFR video to constant frame rate."""
@@ -284,7 +287,7 @@ def normalize_to_cfr(video_path, output_path, total_duration=0):
         '-c:a', 'copy', output_path
     ]
     if total_duration > 0:
-        returncode = run_ffmpeg_with_progress(command, total_duration, desc="VFR → CFR")
+        returncode, stderr_text = run_ffmpeg_with_progress(command, total_duration, desc="VFR → CFR")
     else:
         try:
             subprocess.run(command, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
@@ -297,6 +300,57 @@ def normalize_to_cfr(video_path, output_path, total_duration=0):
         print(f"  Warning: VFR normalization failed, proceeding with original file.")
         return False
     return True
+
+def build_filtergraph(scenes_analysis, scenes, original_width, original_height,
+                      output_width, output_height, fps):
+    """
+    Builds an FFmpeg filter_complex string that processes all scenes in a single pass.
+    
+    For TRACK scenes: trim → crop → scale to output size
+    For LETTERBOX scenes: trim → scale to fit width → pad with black bars
+    Then concat all segments.
+    """
+    filters = []
+    segment_labels = []
+
+    for i, scene_data in enumerate(scenes_analysis):
+        start = scene_data['start_seconds']
+        end = scene_data['end_seconds']
+        strategy = scene_data['strategy']
+        target_box = scene_data['target_box']
+
+        # Trim this scene from the input
+        trim_filter = f"[0:v]trim=start={start}:end={end},setpts=PTS-STARTPTS"
+
+        if strategy == 'TRACK':
+            crop_box = calculate_crop_box(target_box, original_width, original_height)
+            x1, y1, x2, y2 = crop_box
+            crop_w = x2 - x1
+            crop_h = y2 - y1
+            # Crop around the target, then scale to output dimensions
+            filters.append(
+                f"{trim_filter},crop={crop_w}:{crop_h}:{x1}:{y1},"
+                f"scale={output_width}:{output_height},setsar=1[v{i}]"
+            )
+        else:  # LETTERBOX
+            scale_factor = output_width / original_width
+            scaled_height = int(original_height * scale_factor)
+            # Make sure scaled_height is even for yuv420p
+            if scaled_height % 2 != 0:
+                scaled_height += 1
+            y_offset = (output_height - scaled_height) // 2
+            # Scale to fit width, then pad to full output height with black bars
+            filters.append(
+                f"{trim_filter},scale={output_width}:{scaled_height},"
+                f"pad={output_width}:{output_height}:0:{y_offset}:black,setsar=1[v{i}]"
+            )
+        segment_labels.append(f"[v{i}]")
+
+    # Concatenate all segments
+    concat_inputs = ''.join(segment_labels)
+    filters.append(f"{concat_inputs}concat=n={len(segment_labels)}:v=1:a=0[outv]")
+
+    return ';'.join(filters)
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Smartly crops a horizontal video into a vertical one.")
@@ -421,6 +475,8 @@ if __name__ == '__main__':
     original_width, original_height, fps = get_video_properties(input_video)
     
     OUTPUT_HEIGHT = original_height
+    if OUTPUT_HEIGHT % 2 != 0:
+        OUTPUT_HEIGHT += 1
     OUTPUT_WIDTH = int(OUTPUT_HEIGHT * ASPECT_RATIO)
     if OUTPUT_WIDTH % 2 != 0:
         OUTPUT_WIDTH += 1
@@ -432,6 +488,8 @@ if __name__ == '__main__':
         scenes_analysis.append({
             'start_frame': start_time.get_frames(),
             'end_frame': end_time.get_frames(),
+            'start_seconds': start_time.get_seconds(),
+            'end_seconds': end_time.get_seconds(),
             'analysis': analysis,
             'strategy': strategy,
             'target_box': target_box
@@ -455,85 +513,45 @@ if __name__ == '__main__':
         print(f"⏱️  Analysis took {elapsed:.1f}s. Run without --plan-only to encode.")
         sys.exit(0)
 
-    print("\n✂️ Step 4: Processing video frames...")
+    print("\n✂️ Step 4: Processing video frames (native FFmpeg pipeline)...")
     step_start_time = time.time()
-    
+
+    # Build a single FFmpeg filter_complex that handles all scenes in one pass —
+    # no Python in the hot path, no frame-by-frame piping.
+    filtergraph = build_filtergraph(
+        scenes_analysis, scenes, original_width, original_height,
+        OUTPUT_WIDTH, OUTPUT_HEIGHT, fps
+    )
+
     command = [
-        'ffmpeg', '-y', '-f', 'rawvideo', '-vcodec', 'rawvideo',
-        '-s', f'{OUTPUT_WIDTH}x{OUTPUT_HEIGHT}', '-pix_fmt', 'bgr24',
-        '-r', str(fps), '-i', '-',
+        'ffmpeg', '-y', '-i', input_video,
+        '-filter_complex', filtergraph,
+        '-map', '[outv]',
         '-c:v', 'libx264', '-preset', enc_preset, '-crf', enc_crf,
         '-pix_fmt', 'yuv420p',
         '-r', str(fps), '-vsync', 'cfr',
         '-an', temp_video_output
     ]
 
-    ffmpeg_process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    total_duration = media_info.get('duration', 0) if media_info else 0
+    stderr_text = ''
+    if total_duration > 0:
+        returncode, stderr_text = run_ffmpeg_with_progress(command, total_duration, desc="Encoding")
+    else:
+        try:
+            subprocess.run(command, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+            returncode = 0
+        except subprocess.CalledProcessError as e:
+            returncode = e.returncode
+            stderr_text = e.stderr.decode()
 
-    cap = cv2.VideoCapture(input_video)
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    
-    frame_number = 0
-    current_scene_index = 0
-    dropped_frames = 0
-    last_output_frame = None
-    
-    num_scenes = len(scenes_analysis)
-    with tqdm(total=total_frames, desc=f"Processing [scene 1/{num_scenes}]",
-              unit="fr", dynamic_ncols=True,
-              bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]') as pbar:
-        while cap.isOpened():
-            ret, frame = cap.read()
-            if not ret:
-                break
-
-            if current_scene_index < len(scenes_analysis) - 1 and \
-               frame_number >= scenes_analysis[current_scene_index + 1]['start_frame']:
-                current_scene_index += 1
-                pbar.set_description(f"Processing [scene {current_scene_index + 1}/{num_scenes}]")
-
-            scene_data = scenes_analysis[current_scene_index]
-            strategy = scene_data['strategy']
-            target_box = scene_data['target_box']
-
-            try:
-                if strategy == 'TRACK':
-                    crop_box = calculate_crop_box(target_box, original_width, original_height)
-                    processed_frame = frame[crop_box[1]:crop_box[3], crop_box[0]:crop_box[2]]
-                    output_frame = cv2.resize(processed_frame, (OUTPUT_WIDTH, OUTPUT_HEIGHT))
-                else: # LETTERBOX
-                    scale_factor = OUTPUT_WIDTH / original_width
-                    scaled_height = int(original_height * scale_factor)
-                    scaled_frame = cv2.resize(frame, (OUTPUT_WIDTH, scaled_height))
-                    
-                    output_frame = np.zeros((OUTPUT_HEIGHT, OUTPUT_WIDTH, 3), dtype=np.uint8)
-                    y_offset = (OUTPUT_HEIGHT - scaled_height) // 2
-                    output_frame[y_offset:y_offset + scaled_height, :] = scaled_frame
-                last_output_frame = output_frame
-            except Exception:
-                # If frame processing fails, duplicate the last good frame to
-                # maintain frame count and prevent audio drift.
-                dropped_frames += 1
-                if last_output_frame is not None:
-                    output_frame = last_output_frame
-                else:
-                    output_frame = np.zeros((OUTPUT_HEIGHT, OUTPUT_WIDTH, 3), dtype=np.uint8)
-            
-            ffmpeg_process.stdin.write(output_frame.tobytes())
-            frame_number += 1
-            pbar.update(1)
-    
-    if dropped_frames > 0:
-        print(f"  ⚠️  {dropped_frames} frame(s) could not be processed and were duplicated from the previous frame.")
-    
-    ffmpeg_process.stdin.close()
-    stderr_output = ffmpeg_process.stderr.read().decode()
-    ffmpeg_process.wait()
-    cap.release()
-
-    if ffmpeg_process.returncode != 0:
-        print("\n❌ FFmpeg frame processing failed.")
-        print("Stderr:", stderr_output)
+    if returncode != 0:
+        print("\n❌ FFmpeg processing failed.")
+        if stderr_text:
+            # Print last 30 lines of stderr (skip the FFmpeg banner)
+            error_lines = stderr_text.strip().split('\n')
+            for line in error_lines[-30:]:
+                print(f"  {line}")
         cleanup_temp_files()
         sys.exit(1)
     step_end_time = time.time()

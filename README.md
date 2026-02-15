@@ -14,13 +14,33 @@ Instead of a simple, static center crop, this script analyzes video content scen
 *   **Automatic Letterboxing:** If multiple people are too far apart for a vertical crop, the script automatically adds black bars (letterboxing) to show the full scene.
 *   **Scene-by-Scene Processing:** All decisions are made per-scene, ensuring a consistent and logical edit without jarring transitions.
 *   **Native Resolution:** The output resolution is dynamically calculated based on the source video's height to prevent quality loss from unnecessary upscaling.
-*   **High Performance:** The processing is offloaded to FFmpeg via a direct pipe, resulting in extremely fast encoding and low CPU usage.
+*   **High Performance:** Video encoding runs entirely inside FFmpeg via a native `filter_complex` pipeline — Python never touches pixel data. A 12-minute 1080p video processes in ~51 seconds on an M1 Mac.
 
 ---
 
 ### Changelog
 
-#### v1.2.0 (2026-02-15)
+#### v1.3.0 (2026-02-15) — Native FFmpeg Pipeline
+
+**Performance:**
+
+*   **3x faster video encoding via native FFmpeg `filter_complex`.** The entire frame processing pipeline has been moved out of Python and into a single FFmpeg command. Instead of decoding every frame into Python, manipulating it with numpy/OpenCV, and piping raw bytes back to FFmpeg, the script now builds an FFmpeg filtergraph (`trim` → `crop`/`scale`/`pad` → `concat`) and lets FFmpeg handle decode, filter, and encode in C — with zero-copy frame passing between stages. Python never touches pixel data during encoding.
+
+    Benchmarks on Apple M1 (MacBook Pro):
+
+    | Input | Resolution | Duration | v1.2 (Python loop) | v1.3 (native FFmpeg) | Speedup |
+    |-------|-----------|----------|--------------------|--------------------|---------|
+    | Conan clip | 1280x720 | 49s | 3.95s | **0.97s** | **4.1x** |
+    | Podcast interview | 1920x1080 | 12 min | 62.8s | **21.1s** | **3.0x** |
+
+    End-to-end (including scene detection + YOLO analysis):
+
+    | Input | v1.2 total | v1.3 total | Speed |
+    |-------|-----------|-----------|-------|
+    | Conan clip (720p, 49s) | ~12s | **~6s** | 8.3x real-time |
+    | Podcast (1080p, 12 min) | 93.5s | **51.3s** | 13.7x real-time |
+
+    Scene detection (PySceneDetect) is now the dominant bottleneck at ~50% of total time. Encoding is no longer the limiting factor.
 
 **New Features:**
 
@@ -28,7 +48,7 @@ Instead of a simple, static center crop, this script analyzes video content scen
 *   **Quality presets (`--quality`).** Choose between `fast` (CRF 28, veryfast), `balanced` (CRF 23, fast — default), or `high` (CRF 18, slow). Power users can override directly with `--crf` and `--preset`.
 *   **Dry-run mode (`--plan-only`).** Runs scene detection and analysis only, prints the processing plan, and exits without encoding. Useful for previewing decisions before committing to a long encode.
 *   **Fixed output pixel format.** Encoder now outputs `yuv420p` instead of `yuv444p`, which is compatible with all players and platforms and produces smaller files.
-*   **Improved logging and progress reporting.** Input file summary upfront, progress bars on all slow operations, current scene indicator during encoding, and a final summary with output size, compression ratio, and processing speed.
+*   **Improved logging and progress reporting.** Input file summary upfront (resolution, duration, fps, codec, file size, frame count), progress bars on all slow operations, and a final summary with output size, compression ratio, and processing speed.
 
 #### v1.1.0 (2026-02-14)
 
@@ -65,17 +85,17 @@ This script is built on a pipeline that uses specialized libraries for each step
 
 *   **Processing Pipeline:**
     1.  **(Pre-processing)** If the source is VFR, it is normalized to constant frame rate.
-    2.  The script uses `PySceneDetect` to get a list of all scene timestamps.
-    3.  It then loops through each scene and uses `OpenCV` to extract a sample frame.
-    4.  This frame is passed to a pre-trained `yolov8n.pt` model to get bounding boxes for all detected people.
-    5.  A set of rules determines the strategy (`TRACK` or `LETTERBOX`) for each scene based on the number and position of the detected people.
-    6.  The script re-reads the input video, applies the planned transformation to every frame, and pipes the raw `bgr24` pixel data to an `FFmpeg` subprocess for efficient encoding.
-    7.  Audio is extracted separately (with start-time offset correction), then merged with the processed video.
+    2.  `PySceneDetect` scans the video and returns a list of scene timestamps.
+    3.  For each scene, `OpenCV` extracts a sample frame and `YOLOv8` detects people in it.
+    4.  A set of rules determines the strategy (`TRACK` or `LETTERBOX`) for each scene based on the number and position of detected people.
+    5.  The script builds an FFmpeg `filter_complex` graph — one `trim→crop→scale` or `trim→scale→pad` chain per scene, concatenated together — and executes it as a single FFmpeg command. Python never touches pixel data; FFmpeg handles decode, filter, and encode entirely in C.
+    6.  Audio is extracted separately (with start-time offset correction), then merged with the processed video.
 
 *   **Performance & Optimizations:**
-    The main performance gain comes from avoiding slow, frame-by-frame processing within a pure Python loop for *writing* the video. By piping frames directly to FFmpeg's optimized C-based `libx264` encoder, we achieve significant speed.
+    Since v1.3, the encoding pipeline runs entirely inside FFmpeg using a `filter_complex` graph. Python only acts as the "planner" (scene detection + YOLO analysis), then hands off a filtergraph to FFmpeg for execution. This eliminates all Python overhead from the hot path: no GIL contention, no BGR↔YUV conversion, no per-frame memory allocation, no 6MB-per-frame pipe I/O.
 
-    *   **Example Benchmark:** On a test 5-minute, 640x360 source video, the entire analysis and conversion process completes in **~11 seconds** on an Apple M1 processor. The video encoding itself runs at over 70x real-time speed.
+    *   **Encoding benchmarks (Apple M1):** 720p encodes at ~50x real-time, 1080p at ~30x real-time.
+    *   **End-to-end:** A 12-minute 1080p video completes in ~51 seconds (13.7x real-time). Scene detection is now the dominant bottleneck.
 
 ---
 
