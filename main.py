@@ -26,67 +26,100 @@ def get_face_cascade():
         _face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
     return _face_cascade
 
-def analyze_scene_content(video_path, scene_start_time, scene_end_time):
+def analyze_scenes_batch(video_path, scenes):
     """
-    Analyzes the middle frame of a scene to detect people and faces.
+    Analyzes the middle frame of every scene in a single pass.
+
+    Opens the video once, extracts all middle frames, runs YOLO batch
+    inference, then performs face detection per person ROI.
+
+    Returns a list (one entry per scene) of detection lists.
     """
     import cv2
+
+    # --- 1. Extract all middle frames in one video open ---
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         print(f"Error: Could not open video {video_path}")
-        return []
+        return [[] for _ in scenes]
 
-    fps = cap.get(cv2.CAP_PROP_FPS)
-    
-    start_frame = scene_start_time.get_frames()
-    end_frame = scene_end_time.get_frames()
-    middle_frame_number = int(start_frame + (end_frame - start_frame) / 2)
-    
-    cap.set(cv2.CAP_PROP_POS_FRAMES, middle_frame_number)
-    
-    ret, frame = cap.read()
-    if not ret:
-        cap.release()
-        return []
-
-    results = get_yolo_model()([frame], verbose=False)
-    
-    detected_objects = []
-
-    for result in results:
-        boxes = result.boxes
-        for box in boxes:
-            if box.cls[0] == 0:
-                x1, y1, x2, y2 = [int(i) for i in box.xyxy[0]]
-                person_box = [x1, y1, x2, y2]
-                
-                person_roi_gray = cv2.cvtColor(frame[y1:y2, x1:x2], cv2.COLOR_BGR2GRAY)
-                faces = get_face_cascade().detectMultiScale(person_roi_gray, scaleFactor=1.1, minNeighbors=5, minSize=(30, 30))
-                
-                face_box = None
-                if len(faces) > 0:
-                    fx, fy, fw, fh = faces[0]
-                    face_box = [x1 + fx, y1 + fy, x1 + fx + fw, y1 + fy + fh]
-
-                detected_objects.append({'person_box': person_box, 'face_box': face_box})
-                
+    frames = []
+    for start_time, end_time in scenes:
+        start_frame = start_time.get_frames()
+        end_frame = end_time.get_frames()
+        middle_frame = int(start_frame + (end_frame - start_frame) / 2)
+        cap.set(cv2.CAP_PROP_POS_FRAMES, middle_frame)
+        ret, frame = cap.read()
+        frames.append(frame if ret else None)
     cap.release()
-    return detected_objects
+
+    # --- 2. Batch YOLO inference on all frames at once ---
+    valid_frames = [f for f in frames if f is not None]
+    if valid_frames:
+        all_results = get_yolo_model()(valid_frames, verbose=False)
+    else:
+        all_results = []
+
+    # Map results back — keep an iterator so we pull from all_results in order
+    results_iter = iter(all_results)
+    per_scene_results = []
+    for frame in frames:
+        if frame is not None:
+            per_scene_results.append(next(results_iter))
+        else:
+            per_scene_results.append(None)
+
+    # --- 3. Post-process: extract persons + face detection ---
+    face_cascade = get_face_cascade()
+    all_detections = []
+
+    for frame, result in zip(frames, per_scene_results):
+        detected_objects = []
+        if frame is not None and result is not None:
+            for box in result.boxes:
+                if box.cls[0] == 0:  # person class
+                    x1, y1, x2, y2 = [int(i) for i in box.xyxy[0]]
+                    person_box = [x1, y1, x2, y2]
+
+                    person_roi_gray = cv2.cvtColor(frame[y1:y2, x1:x2], cv2.COLOR_BGR2GRAY)
+                    faces = face_cascade.detectMultiScale(
+                        person_roi_gray, scaleFactor=1.1, minNeighbors=5, minSize=(30, 30)
+                    )
+
+                    face_box = None
+                    if len(faces) > 0:
+                        fx, fy, fw, fh = faces[0]
+                        face_box = [x1 + fx, y1 + fy, x1 + fx + fw, y1 + fy + fh]
+
+                    detected_objects.append({'person_box': person_box, 'face_box': face_box})
+        all_detections.append(detected_objects)
+
+    return all_detections
 
 
-def detect_scenes(video_path):
-    from scenedetect import VideoManager, SceneManager
+def detect_scenes(video_path, downscale=0, frame_skip=1):
+    """Detect scene boundaries.
+
+    Args:
+        video_path: Path to the video file.
+        downscale: Downscale factor for processing (0 = auto-detect based on
+                   resolution).  Higher values are faster but may miss subtle cuts.
+        frame_skip: Number of frames to skip between each processed frame.
+                    0 = process every frame, 1 = every other frame, etc.
+    """
+    from scenedetect import open_video, SceneManager
     from scenedetect.detectors import ContentDetector
-    video_manager = VideoManager([video_path])
+    video = open_video(video_path)
     scene_manager = SceneManager()
-    scene_manager.add_detector(ContentDetector())
-    video_manager.set_downscale_factor()
-    video_manager.start()
-    scene_manager.detect_scenes(frame_source=video_manager, show_progress=True)
+    scene_manager.add_detector(ContentDetector(luma_only=True))
+    if downscale > 0:
+        scene_manager.auto_downscale = False
+        scene_manager.downscale = downscale
+    else:
+        scene_manager.auto_downscale = True
+    scene_manager.detect_scenes(video, show_progress=True, frame_skip=frame_skip)
     scene_list = scene_manager.get_scene_list()
-    fps = video_manager.get_framerate()
-    video_manager.release()
-    return scene_list, fps
+    return scene_list, video.frame_rate
 
 def get_enclosing_box(boxes):
     if not boxes:
@@ -352,6 +385,80 @@ def build_filtergraph(scenes_analysis, scenes, original_width, original_height,
 
     return ';'.join(filters)
 
+def detect_hw_encoder():
+    """Probes FFmpeg for available hardware H.264 encoders.
+
+    Returns (encoder_name, encoder_type) where encoder_type is one of
+    'videotoolbox', 'nvenc', or 'libx264'.
+    """
+    candidates = [
+        ('h264_videotoolbox', 'videotoolbox'),
+        ('h264_nvenc',        'nvenc'),
+    ]
+    for encoder, etype in candidates:
+        try:
+            result = subprocess.run(
+                ['ffmpeg', '-hide_banner', '-encoders'],
+                capture_output=True, text=True
+            )
+            if encoder in result.stdout:
+                return encoder, etype
+        except FileNotFoundError:
+            break
+    return 'libx264', 'libx264'
+
+def resolve_encoder(requested, hw_encoder_name, hw_encoder_type):
+    """Resolves which encoder to use based on user request.
+
+    requested: 'auto' (default, always libx264 for quality), 'hw' (use hardware
+               if available), or a specific encoder name like 'h264_videotoolbox'.
+    Returns (encoder_name, encoder_type).
+    """
+    if requested == 'auto':
+        return 'libx264', 'libx264'
+    elif requested == 'hw':
+        return hw_encoder_name, hw_encoder_type
+    else:
+        # User specified an explicit encoder
+        if requested == hw_encoder_name:
+            return hw_encoder_name, hw_encoder_type
+        return requested, requested
+
+def build_encoder_args(encoder_type, quality_level, crf_override=None, preset_override=None):
+    """Returns a list of FFmpeg encoder arguments for the given encoder and quality.
+
+    quality_level is one of 'fast', 'balanced', 'high'.
+    crf_override and preset_override allow user to force specific values (libx264 only).
+    """
+    presets = {
+        'libx264': {
+            'fast':     ['-crf', '28', '-preset', 'veryfast'],
+            'balanced': ['-crf', '23', '-preset', 'fast'],
+            'high':     ['-crf', '18', '-preset', 'slow'],
+        },
+        'videotoolbox': {
+            'fast':     ['-b:v', '3M', '-allow_sw', '1', '-realtime', '0'],
+            'balanced': ['-b:v', '6M', '-allow_sw', '1', '-realtime', '0'],
+            'high':     ['-b:v', '12M', '-allow_sw', '1', '-realtime', '0'],
+        },
+        'nvenc': {
+            'fast':     ['-cq', '28', '-preset', 'p1'],
+            'balanced': ['-cq', '23', '-preset', 'p4'],
+            'high':     ['-cq', '18', '-preset', 'p7'],
+        },
+    }
+
+    args = list(presets[encoder_type][quality_level])
+
+    # Allow user overrides for libx264
+    if encoder_type == 'libx264':
+        if crf_override is not None:
+            args[args.index('-crf') + 1] = str(crf_override)
+        if preset_override is not None:
+            args[args.index('-preset') + 1] = preset_override
+
+    return args
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Smartly crops a horizontal video into a vertical one.")
     parser.add_argument('-i', '--input', type=str, required=True, help="Path to the input video file.")
@@ -366,6 +473,15 @@ if __name__ == '__main__':
                         help="Override FFmpeg x264 preset directly (ultrafast..veryslow). Overrides --quality.")
     parser.add_argument('--plan-only', action='store_true',
                         help="Only run scene detection and analysis (Steps 1-3), then print the processing plan without encoding.")
+    parser.add_argument('--frame-skip', type=int, default=1,
+                        help="Frames to skip during scene detection (default: 1 = every other frame). "
+                             "0 = process every frame (most accurate, slowest). Higher = faster but may miss quick cuts.")
+    parser.add_argument('--downscale', type=int, default=0,
+                        help="Downscale factor for scene detection (default: 0 = auto). "
+                             "Higher values (2-4) are faster but may miss subtle scene changes.")
+    parser.add_argument('--encoder', type=str, default='auto',
+                        help="Video encoder: 'auto' (libx264, default), 'hw' (auto-detect hardware encoder), "
+                             "or a specific encoder name like 'h264_videotoolbox' or 'h264_nvenc'.")
     args = parser.parse_args()
 
     # Parse aspect ratio
@@ -376,15 +492,11 @@ if __name__ == '__main__':
         print(f"❌ Invalid aspect ratio '{args.ratio}'. Use format W:H (e.g. 9:16, 4:5, 1:1)")
         sys.exit(1)
 
-    # Resolve encoding quality settings
-    quality_presets = {
-        'fast':     {'crf': 28, 'preset': 'veryfast'},
-        'balanced': {'crf': 23, 'preset': 'fast'},
-        'high':     {'crf': 18, 'preset': 'slow'},
-    }
-    q = quality_presets[args.quality]
-    enc_crf = str(args.crf if args.crf is not None else q['crf'])
-    enc_preset = args.preset if args.preset is not None else q['preset']
+    # Resolve encoder: default is libx264 for best quality; --encoder hw for hardware
+    hw_encoder_name, hw_encoder_type = detect_hw_encoder()
+    encoder_name, encoder_type = resolve_encoder(args.encoder, hw_encoder_name, hw_encoder_type)
+    enc_args = build_encoder_args(encoder_type, args.quality,
+                                  crf_override=args.crf, preset_override=args.preset)
 
     # Defer heavy imports until after arg parsing so --help is instant
     import cv2
@@ -441,7 +553,8 @@ if __name__ == '__main__':
         total_frames_est = int(media_info.get('duration', 0) * media_info.get('fps', 0))
         if total_frames_est > 0:
             print(f"   ~{total_frames_est:,} frames to process")
-    print(f"   Ratio: {args.ratio} | Quality: {args.quality} (crf={enc_crf}, preset={enc_preset})")
+    enc_label = f"{encoder_name} ({' '.join(enc_args)})"
+    print(f"   Ratio: {args.ratio} | Quality: {args.quality} | Encoder: {enc_label}")
     print()
 
     # Pre-processing: normalize VFR to CFR if needed
@@ -456,7 +569,7 @@ if __name__ == '__main__':
 
     print("🎬 Step 1: Detecting scenes...")
     step_start_time = time.time()
-    scenes, _ = detect_scenes(input_video)
+    scenes, _ = detect_scenes(input_video, downscale=args.downscale, frame_skip=args.frame_skip)
     step_end_time = time.time()
     
     if not scenes:
@@ -481,9 +594,11 @@ if __name__ == '__main__':
     if OUTPUT_WIDTH % 2 != 0:
         OUTPUT_WIDTH += 1
 
+    all_detections = analyze_scenes_batch(input_video, scenes)
+
     scenes_analysis = []
-    for i, (start_time, end_time) in enumerate(tqdm(scenes, desc="Analyzing Scenes")):
-        analysis = analyze_scene_content(input_video, start_time, end_time)
+    for i, (start_time, end_time) in enumerate(scenes):
+        analysis = all_detections[i]
         strategy, target_box = decide_cropping_strategy(analysis, original_height)
         scenes_analysis.append({
             'start_frame': start_time.get_frames(),
@@ -527,7 +642,7 @@ if __name__ == '__main__':
         'ffmpeg', '-y', '-i', input_video,
         '-filter_complex', filtergraph,
         '-map', '[outv]',
-        '-c:v', 'libx264', '-preset', enc_preset, '-crf', enc_crf,
+        '-c:v', encoder_name, *enc_args,
         '-pix_fmt', 'yuv420p',
         '-r', str(fps), '-vsync', 'cfr',
         '-an', temp_video_output

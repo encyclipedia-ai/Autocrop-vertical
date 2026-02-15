@@ -1,44 +1,228 @@
-# AutoCrop-Vertical: A Smart Video Cropper for Social Media (Horizontal -> Vertical)
+# AutoCrop-Vertical: Smart Video Cropper for Social Media
 
 ![Demo of AutoCrop-Vertical](https://github.com/kamilstanuch/Autocrop-vertical/blob/main/churchil_queen_vertical_short.gif?raw=true)
 
-AutoCrop-Vertical is a Python script that automatically converts horizontal videos into a vertical format suitable for platforms like TikTok, Instagram Reels, and YouTube Shorts.
+Automatically converts horizontal videos into vertical format for TikTok, Instagram Reels, and YouTube Shorts.
 
-Instead of a simple, static center crop, this script analyzes video content scene-by-scene. It uses object detection to locate people and decides whether to tightly crop the frame on the subjects or to apply letterboxing to preserve a wide shot's composition.
+Instead of a static center crop, the script analyzes each scene using AI (YOLOv8), detects people, and decides whether to crop tightly on the subjects or letterbox to preserve the full shot.
+
+---
+
+### Quick Start
+
+```bash
+git clone https://github.com/kamilstanuch/AutoCrop-Vertical.git
+cd AutoCrop-Vertical
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+
+python3 main.py -i video.mp4 -o vertical.mp4
+```
+
+The `yolov8n.pt` model weights are downloaded automatically on first run.
+
+**Prerequisites:** Python 3.8+ and [FFmpeg](https://ffmpeg.org/) (`ffmpeg` + `ffprobe`) in your PATH.
+
+---
+
+### Usage Examples
+
+```bash
+# Basic — 9:16 vertical, balanced quality
+python3 main.py -i video.mp4 -o vertical.mp4
+
+# Instagram feed (4:5) with high quality
+python3 main.py -i video.mp4 -o vertical.mp4 --ratio 4:5 --quality high
+
+# Fast encode, square format
+python3 main.py -i video.mp4 -o vertical.mp4 --ratio 1:1 --quality fast
+
+# Preview the processing plan without encoding
+python3 main.py -i video.mp4 -o vertical.mp4 --plan-only
+
+# Full control over encoding parameters
+python3 main.py -i video.mp4 -o vertical.mp4 --crf 20 --preset medium
+
+# Use hardware encoder (macOS VideoToolbox / NVIDIA NVENC)
+python3 main.py -i video.mp4 -o vertical.mp4 --encoder hw
+
+# Maximum accuracy scene detection (slower)
+python3 main.py -i video.mp4 -o vertical.mp4 --frame-skip 0
+```
+
+---
+
+### All Flags
+
+**Output:**
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `-i`, `--input` | *(required)* | Path to input video |
+| `-o`, `--output` | *(required)* | Path to output video (`.mp4` appended if no extension) |
+| `--ratio` | `9:16` | Output aspect ratio. Examples: `9:16`, `4:5`, `1:1` |
+
+**Encoding quality:**
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--quality` | `balanced` | Preset: `fast`, `balanced`, or `high` (see table below) |
+| `--encoder` | `auto` | `auto` = libx264 (software), `hw` = hardware if available, or explicit name like `h264_videotoolbox` |
+| `--crf` | *(from quality)* | Override CRF directly, 0-51 lower = better (libx264 only) |
+| `--preset` | *(from quality)* | Override x264 preset directly: `ultrafast`..`veryslow` (libx264 only) |
+
+**Quality presets (libx264):**
+
+| `--quality` | CRF | Preset | Typical use |
+|-------------|-----|--------|-------------|
+| `fast` | 28 | veryfast | Quick previews, drafts |
+| `balanced` | 23 | fast | Good quality, reasonable speed |
+| `high` | 18 | slow | Best quality, largest file, slowest |
+
+**Scene detection tuning:**
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--frame-skip` | `1` | Frames to skip during scene detection. `0` = every frame (most accurate, slowest). `1` = every other frame. Higher = faster |
+| `--downscale` | `0` (auto) | Downscale factor for scene detection. `0` = auto. `2`-`4` = faster but may miss subtle cuts |
+
+**Other:**
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--plan-only` | off | Run scene detection + analysis only, print the plan, exit without encoding |
 
 ---
 
 ### Key Features
 
-*   **Content-Aware Cropping:** Uses a YOLOv8 model to detect people and automatically centers the vertical frame on them.
-*   **Automatic Letterboxing:** If multiple people are too far apart for a vertical crop, the script automatically adds black bars (letterboxing) to show the full scene.
-*   **Scene-by-Scene Processing:** All decisions are made per-scene, ensuring a consistent and logical edit without jarring transitions.
-*   **Native Resolution:** The output resolution is dynamically calculated based on the source video's height to prevent quality loss from unnecessary upscaling.
-*   **High Performance:** Video encoding runs entirely inside FFmpeg via a native `filter_complex` pipeline — Python never touches pixel data. A 12-minute 1080p video processes in ~51 seconds on an M1 Mac.
+*   **Content-Aware Cropping:** YOLOv8 detects people and centers the vertical frame on them.
+*   **Automatic Letterboxing:** When people are too spread out for a vertical crop, black bars are added to preserve the full shot.
+*   **Scene-by-Scene Processing:** Decisions are made per scene for consistent, logical edits.
+*   **Native Resolution:** Output height matches the source to prevent quality loss from upscaling.
+*   **Native FFmpeg Pipeline:** Video encoding runs entirely inside FFmpeg via `filter_complex` — Python never touches pixel data.
+*   **Hardware Encoder Support:** Optional `--encoder hw` auto-detects VideoToolbox (macOS) or NVENC (NVIDIA) with automatic fallback to libx264.
+*   **VFR Handling:** Variable frame rate sources are automatically normalized before processing.
+*   **Audio Sync:** Non-zero stream start times are detected and compensated to keep audio/video aligned.
+
+---
+
+### How It Works
+
+```
+Input Video
+    |
+    v
++-------------------------------+
+| 1. Scene Detection            |  PySceneDetect splits the video into scenes
+|    (--frame-skip, --downscale)|
++---------------+---------------+
+                |
+                v
++-------------------------------+
+| 2. Content Analysis           |  YOLOv8 detects people in each scene's
+|    (middle frame per scene)   |  middle frame; Haar cascade finds faces
++---------------+---------------+
+                |
+                v
++-------------------------------+
+| 3. Strategy Decision          |  Per scene: TRACK (crop on subject)
+|                               |  or LETTERBOX (scale + black bars)
++---------------+---------------+
+                |
+                v
++-------------------------------+
+| 4. FFmpeg filter_complex      |  Single FFmpeg command handles all
+|    (--quality, --encoder)     |  trim -> crop/scale/pad -> concat
++---------------+---------------+
+                |
+                v
++-------------------------------+
+| 5-6. Audio extract + merge    |  Audio synced with start-time offset
++---------------+---------------+
+                |
+                v
+          Output Video
+```
+
+Steps 1-3 are the "planning" phase (Python + AI). Step 4 is the "encoding" phase (pure FFmpeg, no Python in the hot path).
+
+---
+
+### Performance
+
+Benchmarks on Apple M1 MacBook Pro (AC power):
+
+| Resolution | Duration | Total time | Speed |
+|-----------|----------|-----------|-------|
+| 1280x720 | 49s | ~6s | 8.3x real-time |
+| 1920x1080 | 12 min | ~51s | 13.7x real-time |
+
+Scene detection is the dominant bottleneck (~50% of total time). Encoding via FFmpeg `filter_complex` runs at ~30-50x real-time depending on resolution.
+
+---
+
+### Technical Details
+
+This script is built on a pipeline that uses specialized libraries for each step:
+
+*   **Core Libraries:**
+    *   `PySceneDetect`: For accurate, content-aware scene cut detection.
+    *   `Ultralytics (YOLOv8)`: For fast and reliable person detection.
+    *   `OpenCV`: Used for frame manipulation, face detection (as a fallback), and reading video properties.
+    *   `FFmpeg` / `ffprobe`: The backbone of video encoding, audio extraction, and media stream analysis.
+    *   `tqdm`: For clean and informative progress bars in the console.
+
+*   **Processing Pipeline:**
+    1.  **(Pre-processing)** If the source is VFR, it is normalized to constant frame rate.
+    2.  `PySceneDetect` scans the video and returns a list of scene timestamps.
+    3.  For each scene, `OpenCV` extracts a sample frame and `YOLOv8` detects people in it.
+    4.  A set of rules determines the strategy (`TRACK` or `LETTERBOX`) for each scene based on the number and position of detected people.
+    5.  The script builds an FFmpeg `filter_complex` graph — one `trim->crop->scale` or `trim->scale->pad` chain per scene, concatenated together — and executes it as a single FFmpeg command. Python never touches pixel data; FFmpeg handles decode, filter, and encode entirely in C.
+    6.  Audio is extracted separately (with start-time offset correction), then merged with the processed video.
+
+*   **Performance & Optimizations:**
+    Since v1.3, the encoding pipeline runs entirely inside FFmpeg using a `filter_complex` graph. Python only acts as the "planner" (scene detection + YOLO analysis), then hands off a filtergraph to FFmpeg for execution. This eliminates all Python overhead from the hot path: no GIL contention, no BGR-YUV conversion, no per-frame memory allocation, no 6MB-per-frame pipe I/O.
+
+    *   **Encoding benchmarks (Apple M1):** 720p encodes at ~50x real-time, 1080p at ~30x real-time.
+    *   **End-to-end:** A 12-minute 1080p video completes in ~51 seconds (13.7x real-time). Scene detection is now the dominant bottleneck.
 
 ---
 
 ### Changelog
 
+#### v1.4.0 (2026-02-15) — Performance & Hardware Encoding
+
+**Performance:**
+
+*   **~1.7x faster scene detection.** Migrated from deprecated `VideoManager` API to modern `open_video` + `SceneManager`. Default `frame_skip=1` processes every other frame and `luma_only` detection skips color channel comparisons. Both are configurable via `--frame-skip` and `--downscale` flags.
+*   **Batch YOLO inference.** All scene middle frames are now extracted in a single video open and processed as a batch, eliminating repeated file open/close overhead per scene.
+
+**New Features:**
+
+*   **Hardware encoder support (`--encoder`).** New flag with three modes: `auto` (libx264, default for best quality/compatibility), `hw` (auto-detect VideoToolbox on macOS or NVENC on NVIDIA), or an explicit encoder name. Quality presets (`--quality`) map automatically per encoder type.
+*   **Configurable scene detection (`--frame-skip`, `--downscale`).** Power users can tune the speed/accuracy trade-off. Default `--frame-skip 1` is a good balance; use `0` for maximum accuracy on fast-cutting content.
+
 #### v1.3.0 (2026-02-15) — Native FFmpeg Pipeline
 
 **Performance:**
 
-*   **3x faster video encoding via native FFmpeg `filter_complex`.** The entire frame processing pipeline has been moved out of Python and into a single FFmpeg command. Instead of decoding every frame into Python, manipulating it with numpy/OpenCV, and piping raw bytes back to FFmpeg, the script now builds an FFmpeg filtergraph (`trim` → `crop`/`scale`/`pad` → `concat`) and lets FFmpeg handle decode, filter, and encode in C — with zero-copy frame passing between stages. Python never touches pixel data during encoding.
+*   **3x faster video encoding via native FFmpeg `filter_complex`.** The entire frame processing pipeline has been moved out of Python and into a single FFmpeg command. Instead of decoding every frame into Python, manipulating it with numpy/OpenCV, and piping raw bytes back to FFmpeg, the script now builds an FFmpeg filtergraph (`trim` -> `crop`/`scale`/`pad` -> `concat`) and lets FFmpeg handle decode, filter, and encode in C — with zero-copy frame passing between stages. Python never touches pixel data during encoding.
 
     Benchmarks on Apple M1 (MacBook Pro):
 
-    | Input | Resolution | Duration | v1.2 (Python loop) | v1.3 (native FFmpeg) | Speedup |
-    |-------|-----------|----------|--------------------|--------------------|---------|
-    | Conan clip | 1280x720 | 49s | 3.95s | **0.97s** | **4.1x** |
-    | Podcast interview | 1920x1080 | 12 min | 62.8s | **21.1s** | **3.0x** |
+    | Resolution | Duration | v1.2 (Python loop) | v1.3 (native FFmpeg) | Speedup |
+    |-----------|----------|--------------------|--------------------|---------|
+    | 1280x720 | 49s | 3.95s | **0.97s** | **4.1x** |
+    | 1920x1080 | 12 min | 62.8s | **21.1s** | **3.0x** |
 
     End-to-end (including scene detection + YOLO analysis):
 
-    | Input | v1.2 total | v1.3 total | Speed |
-    |-------|-----------|-----------|-------|
-    | Conan clip (720p, 49s) | ~12s | **~6s** | 8.3x real-time |
-    | Podcast (1080p, 12 min) | 93.5s | **51.3s** | 13.7x real-time |
+    | Resolution / Duration | v1.2 total | v1.3 total | Speed |
+    |----------------------|-----------|-----------|-------|
+    | 720p / 49s | ~12s | **~6s** | 8.3x real-time |
+    | 1080p / 12 min | 93.5s | **51.3s** | 13.7x real-time |
 
     Scene detection (PySceneDetect) is now the dominant bottleneck at ~50% of total time. Encoding is no longer the limiting factor.
 
@@ -69,72 +253,3 @@ Instead of a simple, static center crop, this script analyzes video content scen
 *   **Lazy model loading.** YOLO and Haar cascade models are now loaded on first use instead of at import time. Heavy library imports (`torch`, `ultralytics`, `cv2`, etc.) are deferred until after argument parsing, so `--help` is instant.
 *   **Pinned dependency versions.** `requirements.txt` now specifies compatible version ranges to prevent breakage from upstream changes.
 *   **Replaced `exit()` with `sys.exit(1)`.** Ensures proper exit codes and reliable behavior in all environments.
-
----
-
-### Technical Details
-
-This script is built on a pipeline that uses specialized libraries for each step:
-
-*   **Core Libraries:**
-    *   `PySceneDetect`: For accurate, content-aware scene cut detection.
-    *   `Ultralytics (YOLOv8)`: For fast and reliable person detection.
-    *   `OpenCV`: Used for frame manipulation, face detection (as a fallback), and reading video properties.
-    *   `FFmpeg` / `ffprobe`: The backbone of video encoding, audio extraction, and media stream analysis.
-    *   `tqdm`: For clean and informative progress bars in the console.
-
-*   **Processing Pipeline:**
-    1.  **(Pre-processing)** If the source is VFR, it is normalized to constant frame rate.
-    2.  `PySceneDetect` scans the video and returns a list of scene timestamps.
-    3.  For each scene, `OpenCV` extracts a sample frame and `YOLOv8` detects people in it.
-    4.  A set of rules determines the strategy (`TRACK` or `LETTERBOX`) for each scene based on the number and position of detected people.
-    5.  The script builds an FFmpeg `filter_complex` graph — one `trim→crop→scale` or `trim→scale→pad` chain per scene, concatenated together — and executes it as a single FFmpeg command. Python never touches pixel data; FFmpeg handles decode, filter, and encode entirely in C.
-    6.  Audio is extracted separately (with start-time offset correction), then merged with the processed video.
-
-*   **Performance & Optimizations:**
-    Since v1.3, the encoding pipeline runs entirely inside FFmpeg using a `filter_complex` graph. Python only acts as the "planner" (scene detection + YOLO analysis), then hands off a filtergraph to FFmpeg for execution. This eliminates all Python overhead from the hot path: no GIL contention, no BGR↔YUV conversion, no per-frame memory allocation, no 6MB-per-frame pipe I/O.
-
-    *   **Encoding benchmarks (Apple M1):** 720p encodes at ~50x real-time, 1080p at ~30x real-time.
-    *   **End-to-end:** A 12-minute 1080p video completes in ~51 seconds (13.7x real-time). Scene detection is now the dominant bottleneck.
-
----
-
-### Usage
-
-1.  **Clone the repository:**
-    ```bash
-    git clone https://github.com/kamilstanuch/AutoCrop-Vertical.git
-    cd AutoCrop-Vertical
-    ```
-
-2.  **Set up the environment:**
-    A Python virtual environment is recommended.
-    ```bash
-    python3 -m venv .venv
-    source .venv/bin/activate
-    pip install -r requirements.txt
-    ```
-    The `yolov8n.pt` model weights will be downloaded automatically on the first run.
-
-3.  **Run the script:**
-
-    ```bash
-    # Basic usage (9:16, balanced quality)
-    python3 main.py -i video.mp4 -o vertical.mp4
-
-    # Instagram feed (4:5) with high quality
-    python3 main.py -i video.mp4 -o vertical.mp4 --ratio 4:5 --quality high
-
-    # Preview the processing plan without encoding
-    python3 main.py -i video.mp4 -o vertical.mp4 --plan-only
-
-    # Full control over encoding
-    python3 main.py -i video.mp4 -o vertical.mp4 --crf 20 --preset medium
-    ```
-
----
-
-### Prerequisites
-
-*   Python 3.8+
-*   **FFmpeg:** This script requires `ffmpeg` and `ffprobe` to be installed and available in your system's PATH. They can be installed via a package manager (e.g., `brew install ffmpeg` on macOS, `sudo apt install ffmpeg` on Debian/Ubuntu).
