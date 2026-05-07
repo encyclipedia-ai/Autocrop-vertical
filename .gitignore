@@ -11,3 +11,8 @@ __pycache__/
 
 # Temporary files
 temp_*.mp4
+
+# Build artifacts
+build/
+*.egg-info/
+dist/

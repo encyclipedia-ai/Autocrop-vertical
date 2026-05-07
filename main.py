@@ -530,7 +530,7 @@ def build_encoder_args(encoder_type, quality_level, crf_override=None, preset_ov
 
     return args
 
-if __name__ == '__main__':
+def cli():
     parser = argparse.ArgumentParser(description="Smartly crops a horizontal video into a vertical one.")
     parser.add_argument('-i', '--input', type=str, required=True, help="Path to the input video file.")
     parser.add_argument('-o', '--output', type=str, required=True, help="Path to the output video file.")
@@ -900,3 +900,7 @@ if __name__ == '__main__':
     if media_info and media_info.get('duration'):
         speed = media_info['duration'] / total_time if total_time > 0 else 0
         print(f"   Speed:  {speed:.1f}x real-time")
+
+
+if __name__ == "__main__":
+    cli()

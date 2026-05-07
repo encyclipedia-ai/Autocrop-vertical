@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "autocrop-vertical"
+version = "1.4.1"
+description = "Smart video converter using YOLOv8 + PySceneDetect to convert horizontal video to vertical 9:16 for social media."
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "MIT" }
+authors = [
+    { name = "Kamil Stanuch" },
+    { name = "BBBmau" },
+]
+keywords = ["video", "ffmpeg", "yolov8", "vertical", "tiktok", "reels", "shorts"]
+dependencies = [
+    "opencv-python>=4.8,<5.0",
+    "scenedetect[opencv]>=0.6,<0.7",
+    "ultralytics>=8.0,<9.0",
+    "torch>=2.0",
+    "torchvision>=0.15",
+    "tqdm>=4.60",
+]
+
+[project.urls]
+Homepage = "https://github.com/BBBmau/Autocrop-vertical"
+Repository = "https://github.com/BBBmau/Autocrop-vertical"
+
+[project.scripts]
+# Installs `autocrop` as a console command that calls main.cli().
+autocrop = "main:cli"
+
+[tool.setuptools]
+# main.py lives at the repo root; treat it as a single top-level module.
+py-modules = ["main"]
