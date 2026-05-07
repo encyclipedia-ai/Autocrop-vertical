@@ -686,8 +686,16 @@ def cli():
     step_end_time = time.time()
     
     if not scenes:
-        print("❌ No scenes were detected. Aborting.")
-        sys.exit(1)
+        # No scene cuts detected — usually a single continuous shot. Rather
+        # than aborting (which breaks pipelines that just need *some* output
+        # for every input), copy the source video through to the output path
+        # unchanged. The caller still gets a usable file; downstream consumers
+        # can decide whether to re-encode it themselves.
+        print("⚠️  No scenes were detected. Copying input to output unchanged.")
+        import shutil
+        shutil.copyfile(input_video, final_output_video)
+        print(f"✅ Wrote {final_output_video} (passthrough, no autocrop applied).")
+        sys.exit(0)
     
     print(f"✅ Found {len(scenes)} scenes in {step_end_time - step_start_time:.2f}s. Here is the breakdown:")
     for i, (start, end) in enumerate(scenes):
