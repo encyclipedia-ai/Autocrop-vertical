@@ -503,9 +503,13 @@ def build_encoder_args(encoder_type, quality_level, crf_override=None, preset_ov
     """
     presets = {
         'libx264': {
-            'fast':     ['-crf', '28', '-preset', 'veryfast'],
-            'balanced': ['-crf', '23', '-preset', 'fast'],
-            'high':     ['-crf', '18', '-preset', 'slow'],
+            # `-profile:v high -level 4.0` is required for upload pipelines that
+            # validate strict h264 profile/level (TikTok via Upload-Post, etc.).
+            # Without it the same encoder can emit 4.1+ bitstreams that get
+            # rejected with "Unsupported image size" or similar misleading errors.
+            'fast':     ['-crf', '28', '-preset', 'veryfast', '-profile:v', 'high', '-level', '4.0'],
+            'balanced': ['-crf', '23', '-preset', 'fast',     '-profile:v', 'high', '-level', '4.0'],
+            'high':     ['-crf', '18', '-preset', 'slow',     '-profile:v', 'high', '-level', '4.0'],
         },
         'videotoolbox': {
             'fast':     ['-b:v', '3M', '-allow_sw', '1', '-realtime', '0'],
@@ -857,7 +861,14 @@ def cli():
         step_start_time = time.time()
         merge_command = [
             'ffmpeg', '-y', '-i', temp_video_output, '-i', temp_audio_output,
-            '-c:v', 'copy', '-c:a', 'copy', '-shortest', final_output_video
+            '-c:v', 'copy', '-c:a', 'copy', '-shortest',
+            # `+faststart` moves the moov atom to the head of the file so that
+            # downstream validators (TikTok / Upload-Post / web players) can
+            # probe duration & dimensions without downloading the full file.
+            # Without this, Upload-Post rejects otherwise-valid clips with a
+            # misleading "Unsupported image size" error.
+            '-movflags', '+faststart',
+            final_output_video
         ]
         try:
             subprocess.run(merge_command, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
@@ -872,8 +883,21 @@ def cli():
         cleanup_temp_files()
     else:
         print("\n🔇 Step 5: No audio stream detected, skipping audio extraction.")
-        # Just rename the temp video as the final output
-        os.rename(temp_video_output, final_output_video)
+        # Remux (not rename) so the final file gets `+faststart`. Same rationale
+        # as the audio-present branch above: downstream validators need the moov
+        # atom at the head of the file.
+        remux_command = [
+            'ffmpeg', '-y', '-i', temp_video_output,
+            '-c', 'copy', '-movflags', '+faststart',
+            final_output_video
+        ]
+        try:
+            subprocess.run(remux_command, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        except subprocess.CalledProcessError as e:
+            print("\n❌ Final remux (faststart) failed.")
+            print("Stderr:", e.stderr.decode())
+            cleanup_temp_files()
+            sys.exit(1)
         cleanup_temp_files()
 
     script_end_time = time.time()
