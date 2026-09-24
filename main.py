@@ -1,3 +1,4 @@
+import math
 import sys
 import time
 import subprocess
@@ -6,6 +7,20 @@ import os
 
 # --- Constants ---
 ASPECT_RATIO = 9 / 16
+
+# A centered crop may hang off the source by this fraction of its size on
+# one side. Past the cap the subject sits slightly off center, so a face in
+# the corner does not become a postage stamp on a black field.
+MAX_BLACK_FRACTION = 0.38
+# Where the face sits in a tightened crop, measured from the top. Near the
+# middle, with a little more room below for shoulders than above for ceiling.
+FACE_Y_FRACTION = 0.47
+# Detector jitter below this (scaled from 1080p) does not move the camera.
+CAMERA_DEAD_ZONE_PX = 6.0
+CAMERA_DEAD_ZONE_REF_HEIGHT = 1080.0
+# Seconds the camera takes to travel one crop width. A speaker switch glides
+# instead of snapping; a real scene cut still cuts.
+CAMERA_CROSS_SEC = 0.7
 
 # Lazy-loaded models — initialized on first use so that importing the module
 # or running --help doesn't trigger heavyweight model loading.
@@ -271,6 +286,72 @@ def decide_cropping_strategy(scene_analysis, frame_height, motion_threshold=0.5)
     else:
         return 'LETTERBOX', None
 
+def place_axis(center, crop_size, frame_size, max_black_fraction=MAX_BLACK_FRACTION):
+    """Origin of a window of `crop_size` centered on `center`.
+
+    When the centered window fits, it stays inside the source (full bleed).
+    When it does not, it may extend past the frame so the subject stays
+    centered, but only by `max_black_fraction` of the window on that side.
+    A window that already fills the axis stays at 0: shifting it would
+    letterbox the whole axis.
+    """
+    crop_size = float(crop_size)
+    frame_size = float(frame_size)
+    if crop_size >= frame_size - 0.5:
+        return 0.0
+    ideal = float(center) - crop_size / 2.0
+    inside_hi = frame_size - crop_size
+    if 0.0 <= ideal <= inside_hi:
+        return ideal
+    max_black = max(0.0, max_black_fraction) * crop_size
+    lo = -max_black
+    hi = inside_hi + max_black
+    if ideal < lo:
+        return lo
+    if ideal > hi:
+        return hi
+    return ideal
+
+
+def region_for_point(cx, cy, crop_w, crop_h, frame_width, frame_height,
+                     face_y_fraction=FACE_Y_FRACTION,
+                     max_black_fraction=MAX_BLACK_FRACTION):
+    """(x, y, w, h) window on a subject point, allowed to overhang the source.
+
+    Horizontally the window is centered on `cx`. Vertically a short window
+    puts `cy` at `face_y_fraction` of its height; a full-height window cannot
+    move the subject up or down and stays glued to y=0.
+    """
+    x = int(round(place_axis(cx, crop_w, frame_width, max_black_fraction)))
+    if crop_h >= frame_height - 0.5:
+        y = 0
+    else:
+        desired_cy = cy + (0.5 - face_y_fraction) * crop_h
+        y = int(round(place_axis(desired_cy, crop_h, frame_height, max_black_fraction)))
+    return x, y, int(crop_w), int(crop_h)
+
+
+def camera_dead_zone(frame_height):
+    """Pixels of subject motion ignored as detector noise, scaled to 1080p."""
+    return max(1.0, CAMERA_DEAD_ZONE_PX * float(frame_height) / CAMERA_DEAD_ZONE_REF_HEIGHT)
+
+
+def camera_max_step(crop_width, fps):
+    """Max camera travel per frame: one crop width in CAMERA_CROSS_SEC."""
+    if fps <= 0:
+        return float(crop_width)
+    return max(0.5, float(crop_width) / (CAMERA_CROSS_SEC * float(fps)))
+
+
+def chase(current, target, dead, max_step):
+    """Move `current` toward `target`, ignoring shifts inside the dead zone."""
+    delta = target - current
+    if abs(delta) <= dead:
+        return current
+    step = min(abs(delta), max_step)
+    return current + math.copysign(step, delta)
+
+
 def calculate_crop_box(target_box, frame_width, frame_height):
     target_center_x = (target_box[0] + target_box[2]) / 2
     crop_height = frame_height
@@ -281,22 +362,17 @@ def calculate_crop_box(target_box, frame_width, frame_height):
 
 def calculate_crop_box_for_center(target_center_x, frame_width, frame_height,
                                   crop_width=None):
-    """Return a full-height crop centered on x and clamped to the source."""
+    """Return a full-height crop centered on x.
+
+    The window may start below 0 or end past the frame when that is required
+    to keep the subject centered, up to MAX_BLACK_FRACTION of the crop.
+    """
     crop_height = frame_height
     if crop_width is None:
         crop_width = int(crop_height * ASPECT_RATIO)
     crop_width = min(frame_width, int(crop_width))
-    x1 = int(round(target_center_x - crop_width / 2))
-    y1 = 0
-    x2 = x1 + crop_width
-    y2 = frame_height
-    if x1 < 0:
-        x1 = 0
-        x2 = crop_width
-    if x2 > frame_width:
-        x2 = frame_width
-        x1 = frame_width - crop_width
-    return x1, y1, x2, y2
+    x1 = int(round(place_axis(target_center_x, crop_width, frame_width)))
+    return x1, 0, x1 + crop_width, crop_height
 
 
 def smoothstep(progress):
@@ -340,15 +416,16 @@ def frame_difference_score(frame_before, frame_after):
 
 
 def face_zoom_region(face_box, frame_width, frame_height, face_fraction=0.18,
-                     max_upscale=2.0, min_gain=0.9, face_y_fraction=0.38):
+                     max_upscale=2.0, min_gain=0.9, face_y_fraction=FACE_Y_FRACTION):
     """Tighter (x, y, w, h) source region that makes a small face readable.
 
     Sizes the crop so the face is `face_fraction` of the output height,
     but never upscales the source by more than `max_upscale` (quality) and
     never bothers when the crop would still be >= min_gain of the frame
-    height. The face centre sits at `face_y_fraction` of the crop (upper
-    third) so there is more room for shoulders than for ceiling. Returns
-    None when no zoom is warranted.
+    height. The face centre sits at `face_y_fraction` of the crop (near the
+    vertical middle, leaving room for shoulders). The window may overhang
+    the source, with the same black cap as a full-height crop, so a face
+    near the edge stays centered. Returns None when no zoom is warranted.
     """
     if face_box is None or face_fraction <= 0:
         return None
@@ -368,11 +445,8 @@ def face_zoom_region(face_box, frame_width, frame_height, face_fraction=0.18,
     crop_w = int(round(crop_w))
     cx = (face_box[0] + face_box[2]) / 2.0
     cy = (face_box[1] + face_box[3]) / 2.0
-    x = int(round(cx - crop_w / 2.0))
-    y = int(round(cy - face_y_fraction * crop_h))
-    x = max(0, min(frame_width - crop_w, x))
-    y = max(0, min(frame_height - crop_h, y))
-    return x, y, crop_w, crop_h
+    return region_for_point(cx, cy, crop_w, crop_h, frame_width, frame_height,
+                            face_y_fraction=face_y_fraction)
 
 
 def plan_face_zoom(scenes_analysis, frame_width, frame_height,
@@ -420,13 +494,15 @@ def scene_steady_region(scene_data, frame_width, frame_height):
 
 def interpolate_region(start, end, frame_offset, duration_frames, frame_width,
                        frame_height=None):
-    """Ease a region from start to end, keeping it inside the source.
+    """Ease a region from start to end.
 
     Regions are (x, y, w, h); (x, w) pairs are accepted for full-height
     regions and returned in the same shape. Size and centre are eased
     together with smoothstep, so a zoom converges on the subject while it
     tightens and a pan (equal sizes) reduces to the lateral interpolation
-    used since v1.5.
+    used since v1.5. Origins are not clamped: a crop that overhangs the
+    source must be allowed to glide through that overhang, or the camera
+    hitches at the edge.
     """
     if duration_frames <= 1:
         eased = 1.0
@@ -441,7 +517,6 @@ def interpolate_region(start, end, frame_offset, duration_frames, frame_width,
     start_cx = start[0] + start[2] / 2.0
     end_cx = end[0] + end[2] / 2.0
     x = int(round(start_cx + (end_cx - start_cx) * eased - width / 2.0))
-    x = max(0, min(frame_width - width, x))
     if pair:
         return x, width
     height = int(round(start[3] + (end[3] - start[3]) * eased))
@@ -450,9 +525,6 @@ def interpolate_region(start, end, frame_offset, duration_frames, frame_width,
     start_cy = start[1] + start[3] / 2.0
     end_cy = end[1] + end[3] / 2.0
     y = int(round(start_cy + (end_cy - start_cy) * eased - height / 2.0))
-    y = max(0, y)
-    if frame_height is not None:
-        y = min(frame_height - height, y)
     return x, y, width, height
 
 
@@ -462,6 +534,110 @@ def _transition_frames(duration, fps):
     return max(2, int(round(duration * fps)))
 
 
+def _crop_size(scene, frame_width, frame_height):
+    """(w, h) the scene settles on: face zoom when present, else full height."""
+    zoom = scene.get('zoom_region')
+    if zoom is not None:
+        return int(zoom[2]), int(zoom[3])
+    crop_h = frame_height
+    crop_w = min(frame_width, int(crop_h * ASPECT_RATIO))
+    return crop_w, crop_h
+
+
+def _box_at(boxes, frame):
+    """Box at `frame`, or the nearest stored box if this frame was not filled."""
+    if not boxes:
+        return None
+    box = boxes.get(frame)
+    if box is not None:
+        return box
+    earlier = later = None
+    for n in boxes:
+        if n <= frame and (earlier is None or n > earlier):
+            earlier = n
+        elif n >= frame and (later is None or n < later):
+            later = n
+    if earlier is not None:
+        return boxes[earlier]
+    return boxes[later] if later is not None else None
+
+
+def plan_follow_camera(scenes_analysis, frame_width, frame_height, fps,
+                       face_y_fraction=FACE_Y_FRACTION):
+    """Write per-frame crop regions that chase the active face.
+
+    Speaker turns still decide who is framed (`face_boxes` on the scene).
+    Where the window sits comes from that track's box on each frame:
+
+      * While the active speaker is talking, the target is their face center.
+        `speaking_frames is None` means the shot has no silence signal
+        (a single person) and the face is followed the whole time.
+      * During silence the last target is held, so the frame does not wander
+        with a listener's fidgeting.
+      * A dead zone ignores detector jitter. A max speed makes a speaker
+        switch glide across the frame in about CAMERA_CROSS_SEC per crop
+        width instead of snapping.
+      * A real scene cut snaps. Speaker-turn boundaries do not: the camera
+        is already moving, so plan_pan_transitions does not also pan them.
+        Entering a followed shot from a group/letterbox segment snaps too;
+        the layout zoom is what carries the picture onto the subject.
+
+    Scenes without `face_boxes` keep their locked target box.
+    """
+    cam_x = cam_y = None
+    hold_x = hold_y = None
+    for i, scene in enumerate(scenes_analysis):
+        boxes = scene.get('face_boxes')
+        hard = i == 0 or scene.get('boundary_source') != 'speaker-turn'
+        prev_followed = i > 0 and bool(scenes_analysis[i - 1].get('face_boxes'))
+        if not boxes:
+            if hard:
+                cam_x = cam_y = None
+                hold_x = hold_y = None
+            scene.pop('follow_regions', None)
+            continue
+
+        crop_w, crop_h = _crop_size(scene, frame_width, frame_height)
+        dead = camera_dead_zone(frame_height)
+        max_step = camera_max_step(crop_w, fps)
+        speaking = scene.get('speaking_frames')
+        speaking_set = None if speaking is None else set(speaking)
+        snap = hard or not prev_followed or cam_x is None
+        follow = {}
+        for n in range(scene['start_frame'], scene['end_frame']):
+            box = _box_at(boxes, n)
+            if box is not None:
+                cx = (box[0] + box[2]) / 2.0
+                cy = (box[1] + box[3]) / 2.0
+                active = speaking_set is None or n in speaking_set
+                if active or hold_x is None:
+                    hold_x, hold_y = cx, cy
+            if hold_x is None:
+                continue
+            if snap:
+                cam_x, cam_y = hold_x, hold_y
+                snap = False
+            else:
+                cam_x = chase(cam_x, hold_x, dead, max_step)
+                cam_y = chase(cam_y, hold_y, dead, max_step)
+            follow[n] = region_for_point(
+                cam_x, cam_y, crop_w, crop_h, frame_width, frame_height,
+                face_y_fraction=face_y_fraction)
+        scene['follow_regions'] = follow
+    return scenes_analysis
+
+
+def scene_region_at(scene_data, frame_number, frame_width, frame_height):
+    """Region the camera (or the locked crop) is on at one frame."""
+    follow = scene_data.get('follow_regions') or {}
+    if frame_number in follow:
+        return follow[frame_number]
+    if follow:
+        nearest = min(follow, key=lambda n: (abs(n - frame_number), n))
+        return follow[nearest]
+    return scene_steady_region(scene_data, frame_width, frame_height)
+
+
 def plan_pan_transitions(video_path, scenes_analysis, frame_width, frame_height,
                          fps, pan_duration=0.4, hard_cut_threshold=0.18,
                          jitter_ratio=0.08, zoom_duration=None):
@@ -469,11 +645,15 @@ def plan_pan_transitions(video_path, scenes_analysis, frame_width, frame_height,
 
     Each scene after the first gets `boundary_kind` and, when eased, a
     `transition` dict {kind, from_x, from_w, to_x, to_w, duration_frames}
-    describing how the source region moves from the previous scene's steady
-    region to this scene's over the first frames of the scene:
+    describing how the source region moves from the previous scene's region
+    to this scene's over the first frames of the scene:
 
       pan        TRACK->TRACK crop jump larger than jitter_ratio, eased over
-                 pan_duration (speaker switches, over-segmented shots).
+                 pan_duration. Skipped when both sides carry a face path:
+                 the follow camera is already gliding.
+      follow     TRACK->TRACK where both sides have a face path. No boundary
+                 pan; plan_follow_camera owns the motion, including across
+                 speaker turns. A real cut snaps inside the camera.
       hold       TRACK->TRACK jump below jitter_ratio: no movement.
       zoom-in    LETTERBOX->TRACK: the whole frame tightens onto the subject
                  over zoom_duration.
@@ -502,9 +682,19 @@ def plan_pan_transitions(video_path, scenes_analysis, frame_width, frame_height,
         previous = scenes_analysis[i - 1]
         prev_strategy = previous.get('strategy')
         cur_strategy = scene.get('strategy')
-        from_region = scene_steady_region(previous, frame_width, frame_height)
-        to_region = scene_steady_region(scene, frame_width, frame_height)
         available_frames = max(1, scene['end_frame'] - scene['start_frame'])
+
+        if prev_strategy == cur_strategy == 'TRACK' \
+                and previous.get('face_boxes') and scene.get('face_boxes'):
+            # The camera owns this boundary. A speaker turn glides; a real
+            # cut stays a cut and the camera snaps instead of panning.
+            if scene.get('boundary_source') == 'speaker-turn':
+                scene['boundary_kind'] = 'follow'
+            continue
+
+        from_region = scene_region_at(
+            previous, max(previous['start_frame'], previous['end_frame'] - 1),
+            frame_width, frame_height)
 
         if prev_strategy != cur_strategy:
             kind = 'zoom-in' if cur_strategy == 'TRACK' else 'zoom-out'
@@ -518,6 +708,8 @@ def plan_pan_transitions(video_path, scenes_analysis, frame_width, frame_height,
             if previous.get('target_box') is None or \
                     scene.get('target_box') is None:
                 continue
+            to_region = scene_region_at(
+                scene, scene['start_frame'], frame_width, frame_height)
             same_size = abs(to_region[2] - from_region[2]) < min_pan_distance
             if same_size and abs(to_region[0] - from_region[0]) < min_pan_distance \
                     and abs(to_region[1] - from_region[1]) < min_pan_distance:
@@ -526,6 +718,9 @@ def plan_pan_transitions(video_path, scenes_analysis, frame_width, frame_height,
             kind = 'pan'
             duration = min(pan_frames, available_frames)
 
+        to_region = scene_region_at(
+            scene, scene['start_frame'] + duration - 1,
+            frame_width, frame_height)
         scene['boundary_kind'] = kind
         scene['transition'] = {
             'kind': kind,
@@ -555,6 +750,7 @@ def summarize_pan_plan(scenes_analysis):
         'layout_switch': 0,
         'speaker_turns': 0,
         'face_zoom': sum(1 for s in scenes_analysis if s.get('zoom_region')),
+        'follow': 0,
     }
     for i in range(1, len(scenes_analysis)):
         previous, current = scenes_analysis[i - 1], scenes_analysis[i]
@@ -573,6 +769,8 @@ def summarize_pan_plan(scenes_analysis):
             summary['hold'] += 1
         elif kind == 'layout-switch':
             summary['layout_switch'] += 1
+        elif kind == 'follow':
+            summary['follow'] += 1
     return summary
 
 
@@ -598,13 +796,16 @@ def resolve_frame_region(scene_data, frame_number, frame_width, frame_height):
     Single source of truth for per-frame framing. The production encode
     loop, the unit tests, and scripts/pan_lab.py all call this so a
     transition that works in the lab is the transition that ships.
+
+    A layout zoom still owns its frames. Otherwise a follow-camera scene
+    uses the damped per-frame crop, which may start below 0 or end past
+    the source. Locked TRACK/LETTERBOX scenes fall back to the steady crop.
     """
-    region = scene_steady_region(scene_data, frame_width, frame_height)
     transition = scene_data.get('transition')
     if transition:
         offset = frame_number - scene_data['start_frame']
         if 0 <= offset < transition['duration_frames']:
-            region = interpolate_region(
+            return interpolate_region(
                 (transition['from_x'], transition.get('from_y', 0),
                  transition['from_w'], transition.get('from_h', frame_height)),
                 (transition['to_x'], transition.get('to_y', 0),
@@ -614,7 +815,10 @@ def resolve_frame_region(scene_data, frame_number, frame_width, frame_height):
                 frame_width,
                 frame_height,
             )
-    return region
+    follow = scene_data.get('follow_regions')
+    if follow and frame_number in follow:
+        return follow[frame_number]
+    return scene_steady_region(scene_data, frame_width, frame_height)
 
 
 def is_full_frame_region(region, frame_width, frame_height):
@@ -644,14 +848,33 @@ def render_region(frame, x, width, frame_width, frame_height,
     tighter face zoom, which is upscaled with bicubic filtering). A wider
     region is scaled to the output width and centred between black bars
     (LETTERBOX, and every intermediate frame of a zoom).
+
+    The crop may start below 0 or end past the source so a face at the edge
+    can stay centered. Only the intersection with the source is copied;
+    the overhang stays black and is scaled with the rest of the crop.
     """
     import cv2
     import numpy as np
     if height is None:
-        height = frame_height - y
-    region = frame[y:y + height, x:x + width]
-    scale_factor = output_width / width
-    scaled_height = int(height * scale_factor)
+        height = frame_height if y <= 0 else frame_height - y
+    crop_w = max(1, int(width))
+    crop_h = max(1, int(height))
+    x = int(x)
+    y = int(y)
+    src_h, src_w = frame.shape[:2]
+    x1 = max(0, x)
+    y1 = max(0, y)
+    x2 = min(src_w, x + crop_w)
+    y2 = min(src_h, y + crop_h)
+    if x1 >= x2 or y1 >= y2:
+        region = np.zeros((crop_h, crop_w, 3), dtype=frame.dtype)
+    elif x1 == x and y1 == y and (x2 - x1) == crop_w and (y2 - y1) == crop_h:
+        region = frame[y1:y2, x1:x2]
+    else:
+        region = np.zeros((crop_h, crop_w, 3), dtype=frame.dtype)
+        region[y1 - y:y2 - y, x1 - x:x2 - x] = frame[y1:y2, x1:x2]
+    scale_factor = output_width / crop_w
+    scaled_height = int(crop_h * scale_factor)
     interpolation = cv2.INTER_CUBIC if scale_factor > 1.0 else cv2.INTER_AREA
     if scaled_height >= output_height - 1:
         return cv2.resize(region, (output_width, output_height),
@@ -1039,8 +1262,9 @@ def cli():
     parser.add_argument('--pan-duration', type=float, default=0.4,
                         help="Seconds used to smoothly pan the crop between tracked "
                              "subjects when the crop center jumps (default 0.4). "
-                             "Applies to TRACK-to-TRACK reframes, including speaker "
-                             "switches. Set to 0 to disable.")
+                             "Applies to TRACK-to-TRACK reframes that have no per-frame "
+                             "face path. Speaker switches followed by the damped camera "
+                             "glide on their own. Set to 0 to disable.")
     parser.add_argument('--zoom-duration', type=float, default=None,
                         help="Seconds used to smoothly zoom between the full "
                              "letterboxed frame and a tracked crop when the layout "
@@ -1236,6 +1460,8 @@ def cli():
     face_zoom_count = plan_face_zoom(
         scenes_analysis, original_width, original_height,
         face_fraction=args.face_zoom, max_upscale=args.face_zoom_max_upscale)
+    plan_follow_camera(
+        scenes_analysis, original_width, original_height, fps)
     plan_pan_transitions(
         input_video,
         scenes_analysis,
@@ -1303,8 +1529,10 @@ def cli():
           f"{pan_summary['layout_boundaries']} layout boundaries, "
           f"{pan_summary['speaker_turns']} speaker-turns, "
           f"{pan_summary['face_zoom']} face-zoom scenes, "
+          f"{pan_summary['follow']} follow, "
           f"pan-duration {args.pan_duration:.2f}s, zoom-duration {zoom_duration:.2f}s)")
-    if pan_summary['track_to_track'] and not pan_summary['pan'] and args.pan_duration > 0:
+    uncovered_tracks = pan_summary['track_to_track'] - pan_summary['follow']
+    if uncovered_tracks and not pan_summary['pan'] and args.pan_duration > 0:
         print("   ⚠️  No pans planned despite TRACK->TRACK boundaries. Every crop "
               "change will snap; inspect target boxes with --plan-json.")
     if pan_summary['layout_boundaries'] and not pan_summary['zoom'] and zoom_duration > 0:

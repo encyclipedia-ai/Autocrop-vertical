@@ -36,19 +36,23 @@ autocrop -i in.mp4 -o out.mp4 --speaker-focus auto --speaker-min-dwell 1.2 \
 `speaker.py` tracks faces per frame in multi-person scenes (OpenCV YuNet),
 `asd.py` scores each face per frame with **Light-ASD** (audio-visual active
 speaker detection: does this mouth match the audio?), and the scores become
-speaker turns (dwell + hysteresis) that split the scene into sub-scenes the
-pan/zoom planner eases between. When several people talk at once the frame
-follows the face whose speech dominates the audio (`--speaker-overlap
-loudest`, default) or widens to the group (`group`). A lone face among
-several YOLO bodies (audience, bystanders) is tracked when it is the one
-talking instead of letterboxing everyone. Scenes keep their scene-level
-framing when there is no audio stream or the speaker extras are missing.
+speaker turns (dwell + hysteresis) that decide who is framed. A damped
+camera then follows that face every frame (dead zone for detector jitter,
+max speed so a speaker switch glides; silence holds the last target; a real
+cut snaps). When several people talk at once the frame follows the face
+whose speech dominates the audio (`--speaker-overlap loudest`, default) or
+widens to the group (`group`). A lone face among several YOLO bodies
+(audience, bystanders) is tracked when it is the one talking instead of
+letterboxing everyone. Scenes keep their scene-level framing when there is
+no audio stream or the speaker extras are missing.
 
 When the chosen face is small (a wide shot), the crop tightens around it so
 the face is about `--face-zoom 0.18` of the output height, never upscaling
-the source more than `--face-zoom-max-upscale 2.0`; the face sits in the
-upper third of the frame. Zoomed and full-height crops ease into each other
-like any other pan/zoom. `--face-zoom 0` disables it.
+the source more than `--face-zoom-max-upscale 2.0`; the face sits near the
+vertical middle. Zoomed and full-height crops ease into each other like any
+other zoom. A crop that cannot center the face inside the source may extend
+past the frame (black fill, capped at 38% of the crop). `--face-zoom 0`
+disables the tighten, not the follow.
 
 Requirements: `torch` (CPU is fine, ~1s per 6s of one face), `python_speech_features`,
 `scipy`, `ffmpeg`. Model weights (YuNet 0.2MB, Light-ASD 4MB) are fetched
@@ -75,8 +79,8 @@ clips, 6–7 faces at the table) and publishes the table in the job summary.
 fixtures — `transitions/` (wide shot → speaker left → speaker right → wide
 shot) and `speaker/` (two people, scripted speaker turns) — runs the real
 `autocrop` CLI on them with only the ML detectors stubbed, and asserts that
-the rendered output zooms, pans and follows speaker turns gradually instead
-of snapping.
+the rendered output zooms, glides between speakers and follows turns
+gradually instead of snapping.
 It writes `fixture.mp4` (before), `rendered.mp4` (after), a `contact-sheet.jpg`
 of source-vs-output frames around each boundary, `plan.json`, `report.json`
 and `summary.md`. The `CI` workflow runs it on every PR and uploads those
@@ -304,6 +308,11 @@ This script is built on a pipeline that uses specialized libraries for each step
 ---
 
 ### Changelog
+
+#### v1.10.0 — Follow camera and edge overscan
+
+*   **Damped follow camera.** Speaker turns still decide who is framed. The crop now chases that face's per-frame box instead of holding the median for the whole turn: a few pixels of dead zone so detector jitter does not shimmer, and a max speed of one crop width per 0.7s so a speaker switch glides. Silence holds the last target. A real scene cut snaps. Boundary pans are no longer planned across face paths (`boundary_kind` `follow`); letterbox↔track zooms are unchanged.
+*   **Overscan.** A crop that would otherwise pin against the source edge may extend past the frame, up to 38% of the crop on that side, and the overflow is black. Past the cap the face sits slightly off center. The same rule applies vertically to face-zoom crops, and the face sits near the middle of those crops (`FACE_Y_FRACTION` 0.47) instead of the upper third. `interpolate_region` no longer clamps origins, so a glide does not hitch at the edge.
 
 #### v1.9.0 — Face zoom: tighter crop for small faces
 
