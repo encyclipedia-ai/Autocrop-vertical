@@ -183,8 +183,10 @@ class SceneSplitting(unittest.TestCase):
         self.assertAlmostEqual(subs[2]["end_seconds"], 8.0)
         self.assertEqual(subs[0]["speaker"], {"kind": "track", "track_id": 0, "confidence": 0.8})
         self.assertEqual(subs[2]["speaker"]["kind"], "group")
+        self.assertEqual(len(subs[0]["face_boxes"]), 90)
+        self.assertNotIn("face_boxes", subs[2])
 
-    def test_planner_pans_between_speaker_subscenes_and_counts_turns(self):
+    def test_planner_follows_across_speaker_turns_instead_of_panning(self):
         segs = [
             {"start_frame": 0, "end_frame": 90, "speaker": 0, "confidence": 0.8},
             {"start_frame": 90, "end_frame": 240, "speaker": 1, "confidence": 0.7},
@@ -192,12 +194,19 @@ class SceneSplitting(unittest.TestCase):
         subs = speaker.split_scene_by_speaker(
             self.scene(), segs, self.tracks(), 720,
             lambda analysis, h: autocrop.decide_cropping_strategy(analysis, h))
+        autocrop.plan_follow_camera(subs, 1280, 720, FPS)
         autocrop.plan_pan_transitions(None, subs, 1280, 720, FPS, pan_duration=0.4)
-        self.assertEqual(subs[1]["boundary_kind"], "pan")
-        self.assertEqual(subs[1]["transition"]["duration_frames"], 12)
+        self.assertEqual(subs[1]["boundary_kind"], "follow")
+        self.assertIsNone(subs[1]["transition"])
         summary = autocrop.summarize_pan_plan(subs)
         self.assertEqual(summary["speaker_turns"], 1)
-        self.assertEqual(summary["pan"], 1)
+        self.assertEqual(summary["pan"], 0)
+        self.assertEqual(summary["follow"], 1)
+        before = subs[0]["follow_regions"][89]
+        after = subs[1]["follow_regions"][90]
+        crop_w = before[2]
+        max_step = crop_w / (autocrop.CAMERA_CROSS_SEC * FPS)
+        self.assertLess(abs(after[0] - before[0]), max_step + 2)
         plan = autocrop.serialize_plan(subs, 1280, 720, FPS, "9:16")
         self.assertEqual(plan["scenes"][1]["boundary_source"], "speaker-turn")
         self.assertEqual(plan["scenes"][1]["speaker"]["track_id"], 1)
@@ -250,6 +259,8 @@ class SceneSplitting(unittest.TestCase):
         self.assertEqual(out[0]["strategy"], "TRACK")
         self.assertEqual(out[0]["speaker"]["reason"], "single-speaking-face")
         self.assertEqual(out[0]["target_box"], speaker.median_box(track, 0, 240))
+        self.assertEqual(len(out[0]["face_boxes"]), 240)
+        self.assertIn(0, out[0]["speaking_frames"])
         self.assertIsNotNone(debug[0]["scores"])
 
     def test_lone_silent_face_keeps_letterbox(self):
@@ -268,12 +279,33 @@ class SceneSplitting(unittest.TestCase):
         self.assertEqual(out[0]["strategy"], "LETTERBOX")
         self.assertEqual(out[0]["speaker"]["kind"], "unsplit")
 
-    def test_single_person_scenes_are_untouched(self):
+    def test_single_person_letterbox_scenes_are_untouched(self):
         scene = self.scene()
         scene["analysis"] = scene["analysis"][:1]
         out, debug = speaker.apply_speaker_focus(
             "unused.mp4", [scene], FPS, 720, lambda a, h: ("TRACK", None))
         self.assertIs(out[0], scene)
+        self.assertEqual(debug, {})
+
+    def test_single_person_track_keeps_a_face_path(self):
+        scene = self.scene()
+        scene["analysis"] = scene["analysis"][:1]
+        scene["strategy"] = "TRACK"
+        scene["target_box"] = [220, 100, 420, 700]
+        track = {"id": 0, "first": 0, "last": 239,
+                 "boxes": {n: [300, 160, 360, 220] for n in range(240)}}
+        original = speaker.track_faces
+        speaker.track_faces = lambda *a, **k: [track]
+        try:
+            out, debug = speaker.apply_speaker_focus(
+                "unused.mp4", [scene], FPS, 720, lambda a, h: ("TRACK", None),
+                log=lambda *_: None)
+        finally:
+            speaker.track_faces = original
+        self.assertEqual(len(out), 1)
+        self.assertEqual(len(out[0]["face_boxes"]), 240)
+        self.assertIsNone(out[0]["speaking_frames"])
+        self.assertEqual(out[0]["focus_face"], [300, 160, 360, 220])
         self.assertEqual(debug, {})
 
 

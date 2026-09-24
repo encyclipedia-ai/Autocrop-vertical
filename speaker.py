@@ -377,17 +377,44 @@ def segment_speaker_turns(scores, start_frame, end_frame, fps,
     return segments
 
 
+def speaking_frames(scores, track_id, start_frame, end_frame, origin,
+                    on_threshold=0.5):
+    """Absolute frame numbers in [start, end) where the track is speaking.
+
+    `scores[track_id]` is indexed from `origin` (the scene the array was
+    built for). Returns an empty list when the array exists but the track
+    is silent, and None when there is no score to consult.
+    """
+    if not scores or track_id not in scores:
+        return None
+    probs = scores[track_id]
+    frames = []
+    for n in range(start_frame, end_frame):
+        i = n - origin
+        if 0 <= i < len(probs) and float(probs[i]) >= on_threshold:
+            frames.append(n)
+    return frames
+
+
+def _face_path(track, start_frame, end_frame):
+    """Per-frame boxes for one speaker turn. The camera follows these."""
+    return {n: list(box) for n, box in track["boxes"].items()
+            if start_frame <= n < end_frame}
+
+
 def split_scene_by_speaker(scene, segments, tracks, frame_height,
-                           decide_strategy):
+                           decide_strategy, scores=None):
     """Expand one scene into per-segment sub-scenes for the planner.
 
-    Speaker segments become TRACK scenes targeting the median face box of
-    that track over the segment; 'group' segments keep the scene-level
-    strategy/target. Each sub-scene carries `speaker` metadata and, for
-    all but the first, boundary_source='speaker-turn' so the planner and the
-    summary can tell these visually-continuous boundaries from real cuts.
+    Speaker segments become TRACK scenes. The median face box stays the
+    zoom-sizing target; the per-frame boxes on `face_boxes` are what the
+    camera follows. 'group' segments keep the scene-level strategy/target.
+    Each sub-scene carries `speaker` metadata and, for all but the first,
+    boundary_source='speaker-turn' so the planner and the summary can tell
+    these visually-continuous boundaries from real cuts.
     """
     by_id = {t["id"]: t for t in tracks}
+    origin = scene["start_frame"]
     out = []
     for k, seg in enumerate(segments):
         sub = dict(scene)
@@ -412,6 +439,9 @@ def split_scene_by_speaker(scene, segments, tracks, frame_height,
             sub["speaker"] = {"kind": "track", "track_id": track["id"],
                               "confidence": seg["confidence"]}
             sub["focus_face"] = sub["target_box"]
+            sub["face_boxes"] = _face_path(track, seg["start_frame"], seg["end_frame"])
+            sub["speaking_frames"] = speaking_frames(
+                scores, track["id"], seg["start_frame"], seg["end_frame"], origin)
         sub["boundary_source"] = "speaker-turn" if k > 0 else scene.get("boundary_source")
         out.append(sub)
     return out
@@ -441,14 +471,18 @@ def apply_speaker_focus(video_path, scenes_analysis, fps, frame_height,
     for idx, scene in enumerate(scenes_analysis):
         people = len(scene.get("analysis") or [])
         if people < 2:
-            if zoom_faces and people == 1 and scene.get("strategy") == "TRACK":
-                # One person: no speaker question, but a face box lets the
-                # planner tighten the crop when the face is small (face zoom).
+            if people == 1 and scene.get("strategy") == "TRACK":
+                # One person: no speaker question. The per-frame face is what
+                # the camera follows; the median sizes face zoom when enabled.
                 tracks = track_faces(video_path, scene["start_frame"], scene["end_frame"],
                                      fps, face_stride=face_stride)
                 if len(tracks) == 1:
-                    scene["focus_face"] = median_box(tracks[0], scene["start_frame"],
-                                                     scene["end_frame"])
+                    scene["face_boxes"] = _face_path(
+                        tracks[0], scene["start_frame"], scene["end_frame"])
+                    scene["speaking_frames"] = None
+                    if zoom_faces:
+                        scene["focus_face"] = median_box(
+                            tracks[0], scene["start_frame"], scene["end_frame"])
             out.append(scene)
             continue
         tracks = track_faces(video_path, scene["start_frame"], scene["end_frame"],
@@ -468,6 +502,10 @@ def apply_speaker_focus(video_path, scenes_analysis, fps, frame_height,
                                     "confidence": round(fraction, 3),
                                     "reason": "single-speaking-face"}
                 scene["focus_face"] = scene["target_box"]
+                scene["face_boxes"] = _face_path(track, scene["start_frame"], scene["end_frame"])
+                scene["speaking_frames"] = speaking_frames(
+                    scores, track["id"], scene["start_frame"], scene["end_frame"],
+                    scene["start_frame"])
                 log(f"   speaker-focus: scene {idx + 1} has {people} people, one face "
                     f"speaking {fraction:.0%} of the time -> TRACK that face")
             else:
@@ -500,7 +538,7 @@ def apply_speaker_focus(video_path, scenes_analysis, fps, frame_height,
                                          min_dwell_sec=min_dwell_sec,
                                          overlap=overlap)
         subs = split_scene_by_speaker(scene, segments, tracks, frame_height,
-                                      decide_strategy)
+                                      decide_strategy, scores=scores)
         log(f"   speaker-focus: scene {idx + 1} -> {len(subs)} segment(s) from "
             f"{len(tracks)} face track(s)")
         out.extend(subs)

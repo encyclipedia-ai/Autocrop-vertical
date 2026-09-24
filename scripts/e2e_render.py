@@ -17,8 +17,9 @@ drawn stand-ins rather than real people:
                 scripted speaker score series (A talks, B interjects too
                 briefly to matter, B takes the floor, both talk over each
                 other, A returns). Runs with --speaker-focus auto and asserts
-                the scene is split at speaker turns only, that turns pan and
-                crosstalk widens to the group, and writes the debug overlay.
+                the scene is split at speaker turns only, that the camera glides
+                between speakers and crosstalk widens to the group, and writes
+                the debug overlay.
                 Also loads the real YuNet face detector once as a smoke test.
 
 Per case: fixture.mp4 (before), rendered.mp4 (after), plan.json,
@@ -237,6 +238,15 @@ def measure_output(path):
     return bars, lefts
 
 
+def median_smooth(values, radius=1):
+    """Drop single-frame decode spikes without hiding a real snap."""
+    out = []
+    for i in range(len(values)):
+        window = sorted(values[max(0, i - radius):i + radius + 1])
+        out.append(window[len(window) // 2])
+    return out
+
+
 def gradual(values, expect_increasing, min_distinct, max_step_ratio, noise=2):
     """Judge whether a measured trajectory eased rather than snapped.
 
@@ -314,6 +324,12 @@ def describe(check, values):
 
 def window(series, boundary, frames):
     return series[max(0, boundary - 1): boundary + frames + 1]
+
+
+def glide_frames(distance_px, crop_w, fps):
+    """Frames the damped camera needs to cover `distance_px` of source."""
+    step = max(0.5, crop_w / (autocrop.CAMERA_CROSS_SEC * fps))
+    return max(2, int(abs(distance_px) / step) + 3)
 
 
 # --------------------------------------------------------------------------
@@ -454,7 +470,7 @@ def run_speaker(out_dir, args):
     speakers = [s["speaker"]["track_id"] if (s.get("speaker") or {}).get("kind") == "track"
                 else (s.get("speaker") or {}).get("kind") for s in scenes]
     expected_speakers = [0, 1, "group", 0]
-    expected_kinds = ["pan", "zoom-out", "zoom-in"]
+    expected_kinds = ["follow", "zoom-out", "zoom-in"]
     checks["segments"] = {
         "speakers": speakers, "expected": expected_speakers,
         "starts": [s["start_frame"] for s in scenes],
@@ -474,9 +490,12 @@ def run_speaker(out_dir, args):
                          "bytes": overlay.stat().st_size if overlay.exists() else 0}
 
     zoom_frames = max(2, int(round(args.zoom_duration * fps)))
-    pan_frames = max(2, int(round(args.pan_duration * fps)))
+    # Speaker switches are a damped glide, not a boundary pan. The two faces
+    # sit half a frame apart; the full-height crop is what the camera crosses.
+    crop_w = int(H * autocrop.ASPECT_RATIO)
+    glide = glide_frames(W / 2, crop_w, fps)
     if len(starts) == 3:
-        pan = window(lefts, starts[0], pan_frames)
+        pan = window(lefts, starts[0], glide)
         zout = window(bars, starts[1], zoom_frames)
         zin = window(bars, starts[2], zoom_frames)
         checks["pan"] = dict(values=pan, **gradual(pan, True, 6, 0.4, noise=12))
@@ -490,7 +509,7 @@ def run_speaker(out_dir, args):
             checks[key] = {"ok": False, "distinct": 0, "maxStep": 0, "maxStepRatio": None}
     ok = all(c["ok"] for c in checks.values())
 
-    boundaries = list(zip(["A->B pan", "crosstalk zoom-out", "B->A zoom-in"], starts))
+    boundaries = list(zip(["A->B glide", "crosstalk zoom-out", "B->A zoom-in"], starts))
     if boundaries:
         contact_sheet(fixture, rendered, boundaries, out_dir / "contact-sheet.jpg")
     report = {"ok": ok, "checks": checks, "script": SPEAKER_SCRIPT,
@@ -503,7 +522,7 @@ def run_speaker(out_dir, args):
         f"One scene, two people, scripted speaking: A 0-3s (B interjects 1.5-1.8s), "
         f"B 3-5.5s, crosstalk 5.5-6.8s, A 6.8-8s; dwell {SPEAKER_DWELL_SEC}s, "
         f"overlap policy `group` (scripted scores; real Light-ASD smoke-tested separately). "
-        f"Plan: `{summary.get('speaker_turns')} speaker-turns, {summary.get('pan')} pan / "
+        f"Plan: `{summary.get('speaker_turns')} speaker-turns, {summary.get('follow')} follow / "
         f"{summary.get('zoom')} zoom`.",
         "",
         "| check | result | detail |",
@@ -517,7 +536,7 @@ def run_speaker(out_dir, args):
         f"| segments | {mark(checks['segments']['ok'])} | {speakers} (expected {expected_speakers}) |",
         f"| turn kinds | {mark(checks['turnKinds']['ok'])} | {kinds} (expected {expected_kinds}) |",
         f"| turn timing | {mark(checks['turnTiming']['ok'])} | starts {starts}, script {script_starts} |",
-        f"| A->B pan | {mark(checks['pan']['ok'])} | {describe(checks['pan'], pan) if pan else 'n/a'} |",
+        f"| A->B glide | {mark(checks['pan']['ok'])} | {describe(checks['pan'], pan) if pan else 'n/a'} |",
         f"| crosstalk zoom-out | {mark(checks['zoomOut']['ok'])} | "
         f"{describe(checks['zoomOut'], zout) if zout else 'n/a'} |",
         f"| B->A zoom-in | {mark(checks['zoomIn']['ok'])} | "
@@ -560,21 +579,25 @@ def run_facezoom(out_dir, args):
         "ok": len(scenes) == 2 and summary.get("face_zoom") == 2
         and all(z and z[3] == expected_h for z in zooms),
     }
-    # Face centre sits in the upper third of every zoomed crop.
+    # Face centre sits near the vertical middle of every zoomed crop.
     face_cy = HEAD_Y
     placements = [round((face_cy - z[1]) / z[3], 2) for z in zooms if z]
-    checks["facePlacement"] = {"fractions": placements,
-                               "ok": all(abs(p - 0.38) < 0.05 for p in placements)}
+    checks["facePlacement"] = {
+        "fractions": placements,
+        "ok": all(abs(p - autocrop.FACE_Y_FRACTION) < 0.05 for p in placements),
+    }
     turns = [s for s in scenes if s.get("boundary_source") == "speaker-turn"]
-    t = turns[0]["transition"] if turns and turns[0].get("transition") else None
     checks["turn"] = {
         "kind": turns[0]["boundary_kind"] if turns else None,
-        "heights": (t["from_h"], t["to_h"]) if t else None,
-        "ok": bool(t) and turns[0]["boundary_kind"] == "pan"
-        and t["from_h"] == t["to_h"] == expected_h,
+        "heights": (zooms[0][3], zooms[1][3]) if len(zooms) == 2 and all(zooms) else None,
+        "ok": bool(turns) and turns[0]["boundary_kind"] == "follow"
+        and len(zooms) == 2 and all(z and z[3] == expected_h for z in zooms),
     }
     start = turns[0]["start_frame"] if turns else None
-    pan_frames = max(2, int(round(args.pan_duration * fps)))
+    # Zoomed crop is half the frame; the camera crosses it in CAMERA_CROSS_SEC,
+    # and these two faces are several crop-widths apart.
+    zoom_w = zooms[0][2] if zooms and zooms[0] else int((H // 2) * autocrop.ASPECT_RATIO)
+    pan_frames = glide_frames(W / 2, zoom_w, fps)
     # Rendered frames show ~half the source height throughout (2x zoom).
     # Pan frames are skipped: while the crop edge sweeps across person A the
     # edge probe reads the drawn body, not the background gradient.
@@ -586,14 +609,18 @@ def run_facezoom(out_dir, args):
         "ok": bool(steady) and all(abs(v - expected_h) <= 12 for v in steady),
     }
     pan = window(lefts, start, pan_frames) if start is not None else []
-    checks["pan"] = dict(values=pan, **gradual(pan, True, 6, 0.4, noise=12)) if pan else \
+    # The 2x face crop upscales the fixture's grid, and one decoded frame can
+    # report a left edge tens of pixels off. A 3-frame median removes that
+    # spike; a snap would still be one step covering the whole travel.
+    pan = median_smooth(pan) if pan else pan
+    checks["pan"] = dict(values=pan, **gradual(pan, True, 6, 0.25, noise=20)) if pan else \
         {"ok": False, "distinct": 0, "maxStep": 0, "maxStepRatio": None}
     checks["overlay"] = {"ok": overlay.exists() and overlay.stat().st_size > 0,
                          "bytes": overlay.stat().st_size if overlay.exists() else 0}
     ok = all(c["ok"] for c in checks.values())
 
     if start is not None:
-        contact_sheet(fixture, rendered, [("A->B pan (zoomed)", start)],
+        contact_sheet(fixture, rendered, [("A->B glide (zoomed)", start)],
                       out_dir / "contact-sheet.jpg")
     report = {"ok": ok, "checks": checks, "script": FACEZOOM_SCRIPT,
               "visibleSourceHeightByFrame": heights, "leftSourceXByFrame": lefts}
@@ -604,7 +631,7 @@ def run_facezoom(out_dir, args):
         "",
         f"Two people with small ({2 * head_r}px, {100 * 2 * head_r // H}% of height) faces, "
         f"A talks 0-4s then B 4-8s. The crop should tighten to {expected_h}px of source "
-        f"height (2x, capped by --face-zoom-max-upscale) around the talker's face and pan "
+        f"height (2x, capped by --face-zoom-max-upscale) around the talker's face and glide "
         f"between the two zoomed crops. Plan: `{summary.get('face_zoom')} face-zoom scenes, "
         f"{summary.get('speaker_turns')} speaker-turns`.",
         "",
@@ -614,13 +641,13 @@ def run_facezoom(out_dir, args):
         f"{checks['frameCount']['actual']} / {checks['frameCount']['expected']} |",
         f"| plan | {mark(checks['plan']['ok'])} | zoom regions {zooms} |",
         f"| face placement | {mark(checks['facePlacement']['ok'])} | "
-        f"face centre at {placements} of crop height (want 0.38) |",
+        f"face centre at {placements} of crop height (want {autocrop.FACE_Y_FRACTION}) |",
         f"| A->B turn | {mark(checks['turn']['ok'])} | {checks['turn']['kind']}, "
         f"h {checks['turn']['heights']} |",
         f"| visible source height | {mark(checks['visibleHeight']['ok'])} | "
         f"{checks['visibleHeight']['min']}-{checks['visibleHeight']['max']}px of {H} "
         f"(want ~{expected_h}) |",
-        f"| A->B pan | {mark(checks['pan']['ok'])} | {describe(checks['pan'], pan) if pan else 'n/a'} |",
+        f"| A->B glide | {mark(checks['pan']['ok'])} | {describe(checks['pan'], pan) if pan else 'n/a'} |",
         f"| debug overlay | {mark(checks['overlay']['ok'])} | {checks['overlay']['bytes']} bytes |",
     ]
     return ok, report, lines
