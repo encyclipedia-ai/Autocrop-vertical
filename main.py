@@ -907,6 +907,248 @@ def plan_frame_regions(scenes_analysis, total_frames, frame_width, frame_height)
     return regions
 
 
+def source_pad(regions, src_w, src_h):
+    """Black margin that makes every crop origin non-negative.
+
+    Follow-camera crops may start below 0 or run past the source. FFmpeg's
+    crop filter cannot express that, so the source is padded first and the
+    crop coordinates are shifted into the padded frame.
+    """
+    if not regions:
+        return 0, 0, int(src_w), int(src_h)
+    pad_x = max(0, max(-int(x) for x, _, _, _ in regions))
+    pad_y = max(0, max(-int(y) for _, y, _, _ in regions))
+    right = max(
+        0,
+        max(int(x) + max(1, int(w)) - int(src_w) for x, _, w, _ in regions),
+    )
+    bottom = max(
+        0,
+        max(int(y) + max(1, int(h)) - int(src_h) for _, y, _, h in regions),
+    )
+    return pad_x, pad_y, int(src_w) + pad_x + right, int(src_h) + pad_y + bottom
+
+
+def crop_sendcmd(regions, fps, pad_x, pad_y):
+    """One crop update per frame, timed at frame_index / fps."""
+    step = 1.0 / fps if fps else 0.0
+    lines = []
+    for index, (x, y, width, height) in enumerate(regions):
+        lines.append(
+            f"{index * step:.6f} crop x {int(x) + pad_x}, "
+            f"crop y {int(y) + pad_y}, "
+            f"crop w {max(1, int(width))}, "
+            f"crop h {max(1, int(height))};"
+        )
+    return "\n".join(lines) + "\n"
+
+
+def same_size_runs(regions):
+    """Consecutive frames whose crop width and height stay constant.
+
+    FFmpeg keeps a crop filter's output size for the whole stream. A zoom
+    changes that size, so each stretch of one size is its own segment.
+    Pans inside a segment only move x and y.
+    """
+    runs = []
+    for index, region in enumerate(regions):
+        size = (max(1, int(region[2])), max(1, int(region[3])))
+        if runs and runs[-1]["size"] == size:
+            runs[-1]["end"] = index + 1
+        else:
+            runs.append({"size": size, "start": index, "end": index + 1})
+    return runs
+
+
+def output_scale_filters(crop_w, crop_h, out_w, out_h):
+    """Match render_region: stretch to the frame, or scale to width and letterbox."""
+    scale = out_w / crop_w
+    scaled_h = int(crop_h * scale)
+    flags = "bicubic" if scale > 1.0 else "area"
+    if scaled_h >= out_h - 1:
+        return f"scale={int(out_w)}:{int(out_h)}:flags={flags}"
+    y_offset = (int(out_h) - scaled_h) // 2
+    return (
+        f"scale={int(out_w)}:{scaled_h}:flags={flags},"
+        f"pad={int(out_w)}:{int(out_h)}:(ow-iw)/2:{y_offset}:black"
+    )
+
+
+def ffmpeg_filter_path(path):
+    return path.replace("\\", "\\\\").replace(":", "\\:").replace("'", "\\'")
+
+
+def build_encode_graph(regions, fps, frame_width, frame_height, out_w, out_h, cmd_dir):
+    """Filtergraph that crops each planned region without a raw frame pipe.
+
+    Returns the filter_complex string. The finished frames are labeled [out].
+
+    Crop width and height cannot change on one crop filter, so each stretch of
+    one size is its own branch. Those branches are one frame long during a
+    zoom. Concat gives a one-frame branch no duration and the muxer drops it,
+    so branches are stamped onto one timeline and interleaved. One black frame
+    just past the last real frame, then a cloned pad after fps, gives every
+    frame a duration. Trim drops the black frame and the clone.
+    """
+    os.makedirs(cmd_dir, exist_ok=True)
+    pad_x, pad_y, pad_w, pad_h = source_pad(regions, frame_width, frame_height)
+    runs = same_size_runs(regions)
+    rate = fps if fps and fps > 0 else 30.0
+    parts = [
+        f"[0:v]format=yuv444p,pad={pad_w}:{pad_h}:{pad_x}:{pad_y}:black"
+    ]
+    if len(runs) == 1:
+        parts[0] += "[s0]"
+    else:
+        parts[0] += ",split=" + str(len(runs)) + "".join(f"[s{i}]" for i in range(len(runs)))
+    labels = []
+    for index, run in enumerate(runs):
+        crop_w, crop_h = run["size"]
+        chunk = regions[run["start"]:run["end"]]
+        x0 = int(chunk[0][0]) + pad_x
+        y0 = int(chunk[0][1]) + pad_y
+        moves = any(int(x) + pad_x != x0 or int(y) + pad_y != y0 for x, y, _, _ in chunk)
+        # Each branch has its own crop. sendcmd addresses filters by name, so
+        # a shared "crop" target would move the wrong branch.
+        crop_name = f"crop@run{index}"
+        chain = (
+            f"[s{index}]select=between(n\\,{run['start']}\\,{run['end'] - 1}),"
+            f"setpts=N/({rate:.6f}*TB),"
+        )
+        # A single crop size can keep fps on this branch. Face pans are one
+        # size, and that path already holds every frame.
+        if len(runs) == 1:
+            chain += f"fps={rate:.6f}:eof_action=pass,"
+        if moves:
+            step = 1.0 / rate
+            lines = [
+                f"{i * step:.6f} {crop_name} x {int(x) + pad_x}, "
+                f"{crop_name} y {int(y) + pad_y};"
+                for i, (x, y, _, _) in enumerate(chunk)
+            ]
+            cmd_path = os.path.join(cmd_dir, f"run-{index}.cmd")
+            with open(cmd_path, "w", encoding="utf-8") as handle:
+                handle.write("\n".join(lines) + "\n")
+            chain += f"sendcmd=filename='{ffmpeg_filter_path(cmd_path)}',"
+        chain += (
+            f"{crop_name}=w={crop_w}:h={crop_h}:x={x0}:y={y0},"
+            f"{output_scale_filters(crop_w, crop_h, out_w, out_h)},"
+            f"setsar=1"
+        )
+        if len(runs) == 1:
+            chain += "[v0]"
+        else:
+            chain += f",setpts=(N+{run['start']})/({rate:.6f}*TB)[v{index}]"
+        parts.append(chain)
+        labels.append(f"[v{index}]")
+    if len(runs) == 1:
+        parts.append(f"{labels[0]}format=yuv420p[out]")
+        return ";".join(parts)
+    parts.append(
+        f"color=c=black:s={int(out_w)}x{int(out_h)}:r={rate:.6f}:d=1,"
+        f"trim=end_frame=1,format=yuv444p,"
+        f"setpts={len(regions)}/({rate:.6f}*TB)[tail]"
+    )
+    parts.append(
+        "".join(labels)
+        + "[tail]"
+        + f"interleave=nb_inputs={len(runs) + 1}:duration=longest,"
+        + f"fps={rate:.6f}:eof_action=pass,tpad=stop=1:stop_mode=clone,"
+        + f"trim=end_frame={len(regions)},format=yuv420p[out]"
+    )
+    return ";".join(parts)
+
+
+def run_ffmpeg_encode(
+    input_video,
+    output_path,
+    regions,
+    fps,
+    frame_width,
+    frame_height,
+    output_width,
+    output_height,
+    encoder_name,
+    enc_args,
+    sendcmd_path,
+):
+    """Encode the planned crops in ffmpeg. Returns (returncode, stderr)."""
+    import threading
+
+    graph = build_encode_graph(
+        regions, fps, frame_width, frame_height,
+        output_width, output_height, sendcmd_path,
+    )
+    command = [
+        "ffmpeg", "-y", "-i", input_video,
+        "-filter_complex", graph,
+        "-map", "[out]",
+        "-c:v", encoder_name, *enc_args,
+        "-pix_fmt", "yuv420p",
+        "-an",
+        "-progress", "pipe:1",
+        "-nostats",
+        output_path,
+    ]
+    print(f"   Encoding {len(regions)} frames with ffmpeg ({len(same_size_runs(regions))} crop sizes)")
+    process = subprocess.Popen(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    stderr_lines = []
+
+    def read_stderr():
+        if process.stderr is None:
+            return
+        for line in process.stderr:
+            stderr_lines.append(line)
+
+    reader = threading.Thread(target=read_stderr)
+    reader.start()
+    last_report = time.time()
+    if process.stdout is not None:
+        for line in process.stdout:
+            if not line.startswith("frame="):
+                continue
+            now = time.time()
+            if now - last_report < 2:
+                continue
+            frame = line.split("=", 1)[1].strip()
+            print(f"   Encoding frame {frame}/{len(regions)}")
+            last_report = now
+    returncode = process.wait()
+    reader.join()
+    if process.stdout is not None:
+        process.stdout.close()
+    if process.stderr is not None:
+        process.stderr.close()
+    return returncode, "".join(stderr_lines)
+
+
+def readable_frame_count(video_path):
+    """How many frames ffmpeg will decode.
+
+    The container header count can disagree with the frames the encoder
+    actually emits. The crop script has one command per decoded frame.
+    """
+    probe = subprocess.run(
+        [
+            "ffprobe", "-v", "error", "-select_streams", "v:0",
+            "-count_frames", "-show_entries", "stream=nb_read_frames",
+            "-of", "csv=p=0", video_path,
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    text = probe.stdout.strip().split(",")[0].strip()
+    if probe.returncode != 0 or not text.isdigit():
+        return 0
+    return int(text)
+
+
 def plan_frame_crops(scenes_analysis, total_frames, frame_width, frame_height):
     """Per-frame crop left edge for the whole plan (None for full-frame)."""
     return [
@@ -1319,8 +1561,6 @@ def cli():
                                   crf_override=args.crf, preset_override=args.preset)
 
     # Defer heavy imports until after arg parsing so --help is instant
-    import cv2
-    import numpy as np
     from tqdm import tqdm
 
     script_start_time = time.time()
@@ -1338,15 +1578,19 @@ def cli():
     temp_video_output = f"{base_name}_temp_video.mp4"
     temp_audio_output = f"{base_name}_temp_audio.mkv"
     temp_cfr_input = f"{base_name}_temp_cfr_input.mp4"
-    
+    temp_crop_cmd = f"{base_name}_crops"
+
     def cleanup_temp_files():
         """Remove any leftover temporary files."""
+        import shutil
         for f in [temp_video_output, temp_audio_output, temp_cfr_input]:
             if os.path.exists(f):
                 try:
                     os.remove(f)
                 except OSError:
                     pass
+        if os.path.isdir(temp_crop_cmd):
+            shutil.rmtree(temp_crop_cmd, ignore_errors=True)
 
     # Clean up previous temp files if they exist
     cleanup_temp_files()
@@ -1565,69 +1809,28 @@ def cli():
     print("\n✂️ Step 4: Processing video frames...")
     step_start_time = time.time()
 
-    command = [
-        'ffmpeg', '-y', '-f', 'rawvideo', '-vcodec', 'rawvideo',
-        '-s', f'{OUTPUT_WIDTH}x{OUTPUT_HEIGHT}', '-pix_fmt', 'bgr24',
-        '-r', str(fps), '-i', '-',
-        '-c:v', encoder_name, *enc_args,
-        '-pix_fmt', 'yuv420p',
-        '-r', str(fps), '-vsync', 'cfr',
-        '-an', temp_video_output
-    ]
+    total_frames = readable_frame_count(input_video)
+    if total_frames <= 0:
+        print("\n❌ No frames to encode.")
+        cleanup_temp_files()
+        sys.exit(1)
 
-    ffmpeg_process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-
-    cap = cv2.VideoCapture(input_video)
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-
-    frame_number = 0
-    current_scene_index = 0
-    dropped_frames = 0
-    last_output_frame = None
-
-    num_scenes = len(scenes_analysis)
-    with tqdm(total=total_frames, desc=f"Processing [scene 1/{num_scenes}]",
-              unit="fr", dynamic_ncols=True,
-              bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]') as pbar:
-        while cap.isOpened():
-            ret, frame = cap.read()
-            if not ret:
-                break
-
-            next_index = scene_index_for_frame(
-                scenes_analysis, frame_number, current_scene_index)
-            if next_index != current_scene_index:
-                current_scene_index = next_index
-                pbar.set_description(f"Processing [scene {current_scene_index + 1}/{num_scenes}]")
-
-            scene_data = scenes_analysis[current_scene_index]
-
-            try:
-                output_frame = render_output_frame(
-                    frame, scene_data, frame_number,
-                    original_width, original_height,
-                    OUTPUT_WIDTH, OUTPUT_HEIGHT)
-                last_output_frame = output_frame
-            except Exception:
-                dropped_frames += 1
-                if last_output_frame is not None:
-                    output_frame = last_output_frame
-                else:
-                    output_frame = np.zeros((OUTPUT_HEIGHT, OUTPUT_WIDTH, 3), dtype=np.uint8)
-
-            ffmpeg_process.stdin.write(output_frame.tobytes())
-            frame_number += 1
-            pbar.update(1)
-
-    if dropped_frames > 0:
-        print(f"  ⚠️  {dropped_frames} frame(s) could not be processed and were duplicated from the previous frame.")
-
-    ffmpeg_process.stdin.close()
-    stderr_output = ffmpeg_process.stderr.read().decode()
-    ffmpeg_process.wait()
-    cap.release()
-
-    if ffmpeg_process.returncode != 0:
+    regions = plan_frame_regions(
+        scenes_analysis, total_frames, original_width, original_height)
+    returncode, stderr_output = run_ffmpeg_encode(
+        input_video,
+        temp_video_output,
+        regions,
+        fps,
+        original_width,
+        original_height,
+        OUTPUT_WIDTH,
+        OUTPUT_HEIGHT,
+        encoder_name,
+        enc_args,
+        temp_crop_cmd,
+    )
+    if returncode != 0:
         print("\n❌ FFmpeg frame processing failed.")
         print("Stderr:", stderr_output)
         cleanup_temp_files()
@@ -1641,11 +1844,9 @@ def cli():
         print("\n🔊 Step 5: Extracting original audio...")
         step_start_time = time.time()
 
-        # Some files have a non-zero video start_time (e.g. audio starts at 0s
-        # but video starts at 1.8s). OpenCV ignores this offset and reads frames
-        # from the first video frame, so the processed video starts at 0s.
-        # We must trim the audio to match: skip audio before the video started,
-        # and limit to the video's duration.
+        # The encode starts at the first video frame and retimes it to 0.
+        # Trim the audio to that same start so a file whose video stream
+        # begins after the audio does not drift.
         video_start = get_stream_start_time(input_video, 'v:0')
         audio_extract_command = [
             'ffmpeg', '-y', '-ss', str(video_start),
