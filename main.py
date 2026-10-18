@@ -994,8 +994,10 @@ def build_encode_graph(regions, fps, frame_width, frame_height, out_w, out_h, cm
     pad_x, pad_y, pad_w, pad_h = source_pad(regions, frame_width, frame_height)
     runs = same_size_runs(regions)
     rate = fps if fps and fps > 0 else 30.0
+    # Planar RGB, not yuv444. A near-1:1 bicubic scale in yuv smears chroma,
+    # and the speaker glide is measured from that channel.
     parts = [
-        f"[0:v]format=yuv444p,pad={pad_w}:{pad_h}:{pad_x}:{pad_y}:black"
+        f"[0:v]format=gbrp,pad={pad_w}:{pad_h}:{pad_x}:{pad_y}:black"
     ]
     if len(runs) == 1:
         parts[0] += "[s0]"
@@ -1046,7 +1048,7 @@ def build_encode_graph(regions, fps, frame_width, frame_height, out_w, out_h, cm
         return ";".join(parts)
     parts.append(
         f"color=c=black:s={int(out_w)}x{int(out_h)}:r={rate:.6f}:d=1,"
-        f"trim=end_frame=1,format=yuv444p,"
+        f"trim=end_frame=1,format=gbrp,"
         f"setpts={len(regions)}/({rate:.6f}*TB)[tail]"
     )
     parts.append(
