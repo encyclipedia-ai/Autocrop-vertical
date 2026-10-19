@@ -496,6 +496,10 @@ def run_speaker(out_dir, args):
     glide = glide_frames(W / 2, crop_w, fps)
     if len(starts) == 3:
         pan = window(lefts, starts[0], glide)
+        # crf 28 can decode one frame of this glide a few pixels backwards.
+        # A 3-frame median drops that spike. A real snap still covers the travel
+        # in one step.
+        pan = median_smooth(pan) if pan else pan
         zout = window(bars, starts[1], zoom_frames)
         zin = window(bars, starts[2], zoom_frames)
         checks["pan"] = dict(values=pan, **gradual(pan, True, 6, 0.4, noise=12))

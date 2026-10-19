@@ -626,5 +626,235 @@ class FollowCameraTests(unittest.TestCase):
         self.assertEqual(talk["transition"]["kind"], "zoom-in")
 
 
+class FfmpegCropCommandTests(unittest.TestCase):
+    def test_pad_shifts_a_negative_crop_into_the_frame(self):
+        regions = [(-8, 0, 100, 200), (10, -4, 100, 200)]
+        pad_x, pad_y, pad_w, pad_h = main.source_pad(regions, 1920, 1080)
+        self.assertEqual((pad_x, pad_y, pad_w, pad_h), (8, 4, 1928, 1084))
+        script = main.crop_sendcmd(regions, 10, pad_x, pad_y)
+        self.assertIn("0.000000 crop x 0, crop y 4, crop w 100, crop h 200;", script)
+        self.assertIn("0.100000 crop x 18, crop y 0, crop w 100, crop h 200;", script)
+        self.assertNotIn("crop x -", script)
+        self.assertNotIn("crop y -", script)
+
+    def test_encode_graph_changes_crop_size_in_its_own_segment(self):
+        import tempfile
+        regions = [(-8, 0, 100, 200), (10, -4, 80, 160)]
+        with tempfile.TemporaryDirectory() as directory:
+            graph = main.build_encode_graph(regions, 30, 1920, 1080, 608, 1080, directory)
+        self.assertNotIn("rawvideo", graph)
+        self.assertEqual(len(main.same_size_runs(regions)), 2)
+        self.assertIn("interleave=nb_inputs=3", graph)
+        self.assertIn("trim=end_frame=2", graph)
+        self.assertIn("crop@run0=w=100:h=200:x=0:y=4", graph)
+        self.assertIn("crop@run1=w=80:h=160:x=18:y=0", graph)
+
+    def test_ffmpeg_applies_a_different_crop_on_each_frame(self):
+        import os
+        import shutil
+        import subprocess
+        import tempfile
+
+        if shutil.which("ffmpeg") is None or shutil.which("ffprobe") is None:
+            self.skipTest("ffmpeg is not installed")
+        regions = [(0, 0, 16, 32), (16, 0, 16, 32)]
+        with tempfile.TemporaryDirectory() as directory:
+            source = os.path.join(directory, "source.mp4")
+            output = os.path.join(directory, "out.mp4")
+            cmd = os.path.join(directory, "crops.cmd")
+            built = subprocess.run(
+                [
+                    "ffmpeg", "-y",
+                    "-f", "lavfi", "-i", "color=c=red:s=16x32:r=10:d=0.2",
+                    "-f", "lavfi", "-i", "color=c=blue:s=16x32:r=10:d=0.2",
+                    "-filter_complex", "hstack",
+                    "-frames:v", "2",
+                    "-pix_fmt", "yuv420p",
+                    source,
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+            self.assertEqual(built.returncode, 0, built.stderr.decode()[-500:])
+            code, stderr = main.run_ffmpeg_encode(
+                source, output, regions, 10, 32, 32, 16, 32,
+                "libx264", ["-preset", "ultrafast", "-crf", "18"], cmd,
+            )
+            self.assertEqual(code, 0, stderr[-500:])
+            raw = subprocess.run(
+                ["ffmpeg", "-v", "error", "-i", output, "-f", "rawvideo", "-pix_fmt", "rgb24", "-"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+            self.assertEqual(raw.returncode, 0, raw.stderr.decode()[-500:])
+            frame_bytes = 16 * 32 * 3
+            self.assertGreaterEqual(len(raw.stdout), frame_bytes * 2)
+
+            def channel_mean(buf, channel):
+                return sum(buf[channel::3]) / (len(buf) / 3)
+
+            first = raw.stdout[:frame_bytes]
+            second = raw.stdout[frame_bytes:frame_bytes * 2]
+            self.assertGreater(channel_mean(first, 0), channel_mean(first, 2) + 40)
+            self.assertGreater(channel_mean(second, 2), channel_mean(second, 0) + 40)
+
+    def test_ffmpeg_pans_after_a_crop_size_change(self):
+        import os
+        import shutil
+        import subprocess
+        import tempfile
+
+        if shutil.which("ffmpeg") is None:
+            self.skipTest("ffmpeg is not installed")
+        regions = [(0, 0, 32, 32), (0, 0, 32, 32), (0, 0, 16, 32), (16, 0, 16, 32)]
+        with tempfile.TemporaryDirectory() as directory:
+            source = os.path.join(directory, "source.mp4")
+            output = os.path.join(directory, "out.mp4")
+            built = subprocess.run(
+                [
+                    "ffmpeg", "-y",
+                    "-f", "lavfi", "-i", "color=c=red:s=16x32:r=10:d=0.4",
+                    "-f", "lavfi", "-i", "color=c=blue:s=16x32:r=10:d=0.4",
+                    "-filter_complex", "hstack",
+                    "-frames:v", "4",
+                    "-pix_fmt", "yuv420p",
+                    source,
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+            self.assertEqual(built.returncode, 0, built.stderr.decode()[-500:])
+            code, stderr = main.run_ffmpeg_encode(
+                source, output, regions, 10, 32, 32, 16, 32,
+                "libx264", ["-preset", "ultrafast", "-crf", "18"],
+                os.path.join(directory, "crops"),
+            )
+            self.assertEqual(code, 0, stderr[-500:])
+            raw = subprocess.run(
+                ["ffmpeg", "-v", "error", "-i", output, "-f", "rawvideo", "-pix_fmt", "rgb24", "-"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+            self.assertEqual(raw.returncode, 0, raw.stderr.decode()[-500:])
+            frame_bytes = 16 * 32 * 3
+            self.assertGreaterEqual(len(raw.stdout), frame_bytes * 4)
+
+            def channel_mean(buf, channel):
+                return sum(buf[channel::3]) / (len(buf) / 3)
+
+            left = raw.stdout[frame_bytes * 2:frame_bytes * 3]
+            right = raw.stdout[frame_bytes * 3:frame_bytes * 4]
+            self.assertGreater(channel_mean(left, 0), channel_mean(left, 2) + 40)
+            self.assertGreater(channel_mean(right, 2), channel_mean(right, 0) + 40)
+
+    def test_ffmpeg_zoom_changes_crop_height(self):
+        import os
+        import shutil
+        import subprocess
+        import tempfile
+
+        if shutil.which("ffmpeg") is None:
+            self.skipTest("ffmpeg is not installed")
+        regions = [(0, 0, 32, 32), (0, 0, 32, 16)]
+        with tempfile.TemporaryDirectory() as directory:
+            source = os.path.join(directory, "source.mp4")
+            output = os.path.join(directory, "out.mp4")
+            built = subprocess.run(
+                [
+                    "ffmpeg", "-y",
+                    "-f", "lavfi", "-i", "color=c=red:s=32x16:r=10:d=0.2",
+                    "-f", "lavfi", "-i", "color=c=blue:s=32x16:r=10:d=0.2",
+                    "-filter_complex", "vstack",
+                    "-frames:v", "2",
+                    "-pix_fmt", "yuv420p",
+                    source,
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+            self.assertEqual(built.returncode, 0, built.stderr.decode()[-500:])
+            code, stderr = main.run_ffmpeg_encode(
+                source, output, regions, 10, 32, 32, 16, 16,
+                "libx264", ["-preset", "ultrafast", "-crf", "18"],
+                os.path.join(directory, "crops"),
+            )
+            self.assertEqual(code, 0, stderr[-500:])
+            raw = subprocess.run(
+                ["ffmpeg", "-v", "error", "-i", output, "-f", "rawvideo", "-pix_fmt", "rgb24", "-"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+            self.assertEqual(raw.returncode, 0, raw.stderr.decode()[-500:])
+            frame_bytes = 16 * 16 * 3
+            self.assertGreaterEqual(len(raw.stdout), frame_bytes * 2)
+
+            def channel_mean(buf, channel):
+                return sum(buf[channel::3]) / (len(buf) / 3)
+
+            first_bottom = raw.stdout[:frame_bytes][16 * 12 * 3:]
+            second_bottom = raw.stdout[frame_bytes:frame_bytes * 2][16 * 12 * 3:]
+            self.assertGreater(channel_mean(first_bottom, 2), 80)
+            self.assertLess(channel_mean(second_bottom, 2), 40)
+
+    def test_ffmpeg_keeps_every_frame_when_each_crop_size_is_one_frame(self):
+        import os
+        import shutil
+        import subprocess
+        import tempfile
+
+        if shutil.which("ffmpeg") is None:
+            self.skipTest("ffmpeg is not installed")
+        frame_count = 8
+        regions = [(0, 0, 32, 16 + i) for i in range(frame_count)]
+        with tempfile.TemporaryDirectory() as directory:
+            source = os.path.join(directory, "source.mp4")
+            output = os.path.join(directory, "out.mp4")
+            built = subprocess.run(
+                [
+                    "ffmpeg", "-y",
+                    "-f", "lavfi", "-i", "color=c=black:s=32x32:r=10:d=1",
+                    "-vf", "geq=r='N*30':g=0:b=0",
+                    "-frames:v", str(frame_count),
+                    "-pix_fmt", "yuv420p",
+                    source,
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+            self.assertEqual(built.returncode, 0, built.stderr.decode()[-500:])
+            code, stderr = main.run_ffmpeg_encode(
+                source, output, regions, 10, 32, 32, 16, 16,
+                "libx264", ["-preset", "ultrafast", "-crf", "0"],
+                os.path.join(directory, "crops"),
+            )
+            self.assertEqual(code, 0, stderr[-500:])
+            raw = subprocess.run(
+                ["ffmpeg", "-v", "error", "-i", output, "-f", "rawvideo", "-pix_fmt", "rgb24", "-"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+            self.assertEqual(raw.returncode, 0, raw.stderr.decode()[-500:])
+            frame_bytes = 16 * 16 * 3
+            self.assertEqual(len(raw.stdout) // frame_bytes, frame_count)
+
+            def center_red(buf):
+                x, y = 8, 8
+                return buf[(y * 16 + x) * 3]
+
+            for index in range(frame_count):
+                frame = raw.stdout[index * frame_bytes:(index + 1) * frame_bytes]
+                red = center_red(frame)
+                self.assertGreater(red, index * 30 - 12, f"frame {index} red {red}")
+                self.assertLess(red, index * 30 + 12, f"frame {index} red {red}")
+
+
 if __name__ == "__main__":
     unittest.main()
