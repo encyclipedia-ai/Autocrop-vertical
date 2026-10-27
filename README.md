@@ -6,6 +6,17 @@ Automatically converts horizontal videos into vertical format for TikTok, Instag
 
 Instead of a static center crop, the script analyzes each scene using AI (YOLOv8), detects people, and decides whether to crop tightly on the subjects or letterbox to preserve the full shot.
 
+Customers can override that choice with `--crop-mode`:
+
+| Mode | Behavior |
+|------|----------|
+| `auto` (default) | Smart TRACK vs LETTERBOX from people/motion |
+| `subject` | Always track a person when one is present |
+| `wide` | Always letterbox the full frame |
+| `center` | Fixed center crop (no subject tracking) |
+
+`wide` and `center` disable speaker focus.
+
 ---
 
 ### Quick Start

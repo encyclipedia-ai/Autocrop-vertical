@@ -246,7 +246,18 @@ def get_enclosing_box(boxes):
     max_y = max(box[3] for box in boxes)
     return [min_x, min_y, max_x, max_y]
 
-def decide_cropping_strategy(scene_analysis, frame_height, motion_threshold=0.5):
+def center_crop_box(frame_width, frame_height):
+    """Full-height crop locked to the horizontal center of the source frame."""
+    crop_width = int(round(frame_height * ASPECT_RATIO))
+    if crop_width >= frame_width:
+        return 'LETTERBOX', None
+    x1 = max(0, (frame_width - crop_width) // 2)
+    x2 = min(frame_width, x1 + crop_width)
+    return 'TRACK', (x1, 0, x2, frame_height)
+
+
+def decide_cropping_strategy(scene_analysis, frame_height, motion_threshold=0.5,
+                             crop_mode='auto', frame_width=None):
     """Pick a cropping strategy for a scene.
 
     Args:
@@ -258,7 +269,20 @@ def decide_cropping_strategy(scene_analysis, frame_height, motion_threshold=0.5)
             the scene over the group bounding box. Lower = more aggressive
             tracking of the most active person. 0 = always track the most
             active person; very high = legacy group-only behavior.
+        crop_mode: 'auto' (default smart choice), 'subject' (always track a
+            person when present), 'wide' (always letterbox), or 'center'
+            (fixed center crop; requires frame_width).
+        frame_width: source frame width; required when crop_mode is 'center'.
     """
+    if crop_mode == 'wide':
+        return 'LETTERBOX', None
+    if crop_mode == 'center':
+        if frame_width is None:
+            raise ValueError('frame_width is required when crop_mode is center')
+        return center_crop_box(frame_width, frame_height)
+
+    effective_threshold = 0.0 if crop_mode == 'subject' else motion_threshold
+
     num_people = len(scene_analysis)
     if num_people == 0:
         return 'LETTERBOX', None
@@ -270,7 +294,7 @@ def decide_cropping_strategy(scene_analysis, frame_height, motion_threshold=0.5)
     # on them rather than averaging the whole group.
     motions = [obj.get('motion', 0.0) for obj in scene_analysis]
     max_motion = max(motions)
-    if max_motion >= motion_threshold:
+    if max_motion >= effective_threshold:
         idx = motions.index(max_motion)
         target = scene_analysis[idx]
         target_box = target['face_box'] or target['person_box']
@@ -1461,6 +1485,13 @@ def cli():
     parser.add_argument('-o', '--output', type=str, required=True, help="Path to the output video file.")
     parser.add_argument('--ratio', type=str, default='9:16',
                         help="Output aspect ratio as W:H (default: 9:16). Examples: 9:16, 4:5, 1:1")
+    parser.add_argument('--crop-mode', type=str, default='auto',
+                        choices=['auto', 'subject', 'wide', 'center'],
+                        help="How to frame each scene: 'auto' (default) picks TRACK vs "
+                             "LETTERBOX from people/motion; 'subject' always tracks a "
+                             "person when one is present; 'wide' always letterboxes the "
+                             "full frame; 'center' uses a fixed center crop with no "
+                             "subject tracking. 'wide' and 'center' disable speaker focus.")
     parser.add_argument('--quality', type=str, default='balanced', choices=['fast', 'balanced', 'high'],
                         help="Encoding quality preset (default: balanced). fast=quick encode, balanced=good quality, high=best quality/slow")
     parser.add_argument('--crf', type=int, default=None,
@@ -1668,7 +1699,8 @@ def cli():
         print(f"  - Scene {i+1}: {start.get_timecode()} -> {end.get_timecode()}")
 
 
-    print("\n🧠 Step 2: Analyzing scene content and determining strategy...")
+    print(f"\n🧠 Step 2: Analyzing scene content and determining strategy "
+          f"(crop-mode={args.crop_mode})...")
     step_start_time = time.time()
     # Get fps from OpenCV — the same backend that reads the frames — to avoid
     # frame-rate mismatches between the reader and encoder that cause audio drift.
@@ -1681,7 +1713,8 @@ def cli():
         analysis = analyze_scene_content(input_video, start_time, end_time,
                                          samples=args.analysis_samples)
         strategy, target_box = decide_cropping_strategy(
-            analysis, original_height, motion_threshold=args.motion_threshold)
+            analysis, original_height, motion_threshold=args.motion_threshold,
+            crop_mode=args.crop_mode, frame_width=original_width)
         scenes_analysis.append({
             'start_frame': start_time.get_frames(),
             'end_frame': end_time.get_frames(),
@@ -1692,11 +1725,15 @@ def cli():
             'target_box': target_box
         })
     speaker_debug = {}
-    if args.speaker_focus == 'auto':
+    # Forced wide/center framing has no subject to follow — skip speaker ASD.
+    speaker_focus_enabled = (
+        args.speaker_focus == 'auto' and args.crop_mode in ('auto', 'subject'))
+    if speaker_focus_enabled:
         import speaker
         def decide(analysis, height):
             return decide_cropping_strategy(
-                analysis, height, motion_threshold=args.motion_threshold)
+                analysis, height, motion_threshold=args.motion_threshold,
+                crop_mode=args.crop_mode, frame_width=original_width)
         scenes_analysis, speaker_debug = speaker.apply_speaker_focus(
             input_video, scenes_analysis, fps, original_height, decide,
             min_dwell_sec=args.speaker_min_dwell,
@@ -1804,7 +1841,8 @@ def cli():
         track_count = sum(1 for s in scenes_analysis if s['strategy'] == 'TRACK')
         letterbox_count = sum(1 for s in scenes_analysis if s['strategy'] == 'LETTERBOX')
         elapsed = time.time() - script_start_time
-        print(f"\n📊 Plan summary: {track_count} TRACK / {letterbox_count} LETTERBOX scenes")
+        print(f"\n📊 Plan summary: {track_count} TRACK / {letterbox_count} LETTERBOX scenes "
+              f"(crop-mode={args.crop_mode})")
         print(f"⏱️  Analysis took {elapsed:.1f}s. Run without --plan-only to encode.")
         sys.exit(0)
 
