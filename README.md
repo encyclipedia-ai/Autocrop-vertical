@@ -17,6 +17,10 @@ Customers can override that choice with `--crop-mode`:
 
 `wide` and `center` disable speaker focus.
 
+`--follow-camera off` keeps speaker-focus turns (who is framed) but skips the
+per-frame face chase: each turn holds a steady crop and `--pan-duration`
+eases between speakers. Use this for calmer “follow the talker” framing.
+
 ---
 
 ### Quick Start

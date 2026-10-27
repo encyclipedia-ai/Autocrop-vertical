@@ -1492,6 +1492,12 @@ def cli():
                              "person when one is present; 'wide' always letterboxes the "
                              "full frame; 'center' uses a fixed center crop with no "
                              "subject tracking. 'wide' and 'center' disable speaker focus.")
+    parser.add_argument('--follow-camera', type=str, default='auto',
+                        choices=['auto', 'off'],
+                        help="Per-frame face chase after speaker focus. 'auto' (default) "
+                             "damps the crop onto the active face every frame; 'off' locks "
+                             "each speaker turn to a steady crop and eases between turns "
+                             "with --pan-duration (calmer framing, no face micro-motion).")
     parser.add_argument('--quality', type=str, default='balanced', choices=['fast', 'balanced', 'high'],
                         help="Encoding quality preset (default: balanced). fast=quick encode, balanced=good quality, high=best quality/slow")
     parser.add_argument('--crf', type=int, default=None,
@@ -1743,8 +1749,18 @@ def cli():
     face_zoom_count = plan_face_zoom(
         scenes_analysis, original_width, original_height,
         face_fraction=args.face_zoom, max_upscale=args.face_zoom_max_upscale)
-    plan_follow_camera(
-        scenes_analysis, original_width, original_height, fps)
+    if args.follow_camera == 'auto':
+        plan_follow_camera(
+            scenes_analysis, original_width, original_height, fps)
+    else:
+        # Without follow regions, face_boxes would make plan_pan_transitions
+        # skip TRACK→TRACK pans (it assumes the camera owns those boundaries).
+        # Drop the paths so speaker switches ease via --pan-duration instead.
+        for scene in scenes_analysis:
+            scene.pop('face_boxes', None)
+            scene.pop('speaking_frames', None)
+            scene.pop('follow_regions', None)
+        print("📷 Follow camera off — steady crops per speaker turn, pans between turns.")
     plan_pan_transitions(
         input_video,
         scenes_analysis,
