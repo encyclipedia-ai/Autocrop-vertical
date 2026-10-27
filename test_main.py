@@ -13,6 +13,81 @@ def letterbox(start, end):
             "target_box": None}
 
 
+class CropModeTests(unittest.TestCase):
+    def _people(self, *motions):
+        # Boxes are [x1, y1, x2, y2]; faces optional.
+        out = []
+        for i, motion in enumerate(motions):
+            x = 20 + i * 40
+            out.append({
+                "person_box": [x, 10, x + 30, 80],
+                "face_box": [x + 5, 15, x + 25, 40],
+                "motion": motion,
+            })
+        return out
+
+    def test_wide_always_letterboxes(self):
+        strategy, box = main.decide_cropping_strategy(
+            self._people(1.0), 90, crop_mode="wide", frame_width=160)
+        self.assertEqual(strategy, "LETTERBOX")
+        self.assertIsNone(box)
+
+    def test_center_locks_to_horizontal_middle(self):
+        main.ASPECT_RATIO = 9 / 16
+        strategy, box = main.decide_cropping_strategy(
+            self._people(1.0), 90, crop_mode="center", frame_width=160)
+        self.assertEqual(strategy, "TRACK")
+        self.assertIsNotNone(box)
+        x1, y1, x2, y2 = box
+        self.assertEqual(y1, 0)
+        self.assertEqual(y2, 90)
+        crop_w = x2 - x1
+        self.assertEqual(x1, (160 - crop_w) // 2)
+
+    def test_subject_tracks_most_active_even_with_low_motion(self):
+        # Auto with a high threshold would letterbox; subject forces TRACK.
+        strategy, box = main.decide_cropping_strategy(
+            self._people(0.01, 0.02), 90, motion_threshold=0.5,
+            crop_mode="subject", frame_width=160)
+        self.assertEqual(strategy, "TRACK")
+        self.assertEqual(box, [65, 15, 85, 40])  # face of second (more active)
+
+    def test_auto_letterboxes_when_group_is_too_wide(self):
+        strategy, box = main.decide_cropping_strategy(
+            self._people(0.01, 0.02), 90, motion_threshold=0.5,
+            crop_mode="auto", frame_width=160)
+        self.assertEqual(strategy, "LETTERBOX")
+        self.assertIsNone(box)
+
+    def test_follow_camera_off_lets_speaker_turns_pan(self):
+        # With face_boxes present, plan_pan_transitions used to skip pans
+        # (follow camera owned the boundary). After stripping paths for
+        # --follow-camera off, a speaker-turn boundary must ease.
+        main.ASPECT_RATIO = 9 / 16
+        left = {
+            "start_frame": 0, "end_frame": 30, "strategy": "TRACK",
+            "target_box": [10, 0, 60, 90],
+            "face_boxes": {0: [20, 10, 40, 40]},
+            "boundary_source": "start",
+        }
+        right = {
+            "start_frame": 30, "end_frame": 60, "strategy": "TRACK",
+            "target_box": [100, 0, 150, 90],
+            "face_boxes": {30: [110, 10, 130, 40]},
+            "boundary_source": "speaker-turn",
+        }
+        scenes = [left, right]
+        for scene in scenes:
+            scene.pop("face_boxes", None)
+            scene.pop("speaking_frames", None)
+            scene.pop("follow_regions", None)
+        main.plan_pan_transitions(
+            None, scenes, 160, 90, fps=10,
+            pan_duration=0.4, zoom_duration=0.4)
+        self.assertEqual(right["boundary_kind"], "pan")
+        self.assertIsNotNone(right["transition"])
+
+
 class PanMathTests(unittest.TestCase):
     def test_smoothstep_is_monotonic_and_clamped(self):
         values = [main.smoothstep(i / 20) for i in range(21)]
