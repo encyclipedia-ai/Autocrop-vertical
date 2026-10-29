@@ -395,8 +395,14 @@ def decide_cropping_strategy(scene_analysis, frame_height, motion_threshold=0.5,
     num_people = len(scene_analysis)
     if num_people == 0:
         # Prefer a full-bleed crop on a detected screen/device over black bars.
+        # Pick the largest prop (usually the in-shot display); enclosing every
+        # distant phone/TV would recreate the too-wide letterbox problem.
         if group_framing == 'fill' and object_boxes:
-            return 'TRACK', get_enclosing_box(object_boxes)
+            best = max(
+                object_boxes,
+                key=lambda b: max(0, b[2] - b[0]) * max(0, b[3] - b[1]),
+            )
+            return 'TRACK', best
         return 'LETTERBOX', None
     if num_people == 1:
         target_box = scene_analysis[0]['face_box'] or scene_analysis[0]['person_box']
@@ -433,7 +439,8 @@ def plan_object_compose(scenes_analysis, frame_width):
     """Re-compose TRACK targets with interactive objects after speaker focus.
 
     Speaker focus may replace `target_box` with a face; this pass pulls a
-    nearby screen/laptop/phone back into the frame.
+    nearby screen/laptop/phone back into the frame. When a face-zoom region
+    was already planned, clear it — a tight face crop would drop the prop.
     """
     count = 0
     for scene in scenes_analysis:
@@ -446,6 +453,8 @@ def plan_object_compose(scenes_analysis, frame_width):
         after = compose_target_with_objects(before, objects, frame_width)
         if after is not None and after != before:
             scene['target_box'] = after
+            scene.pop('zoom_region', None)
+            scene['object_composed'] = True
             count += 1
     return count
 
@@ -1903,14 +1912,16 @@ def cli():
             face_stride=args.speaker_face_stride,
             overlap=args.speaker_overlap,
             zoom_faces=args.face_zoom > 0)
+    face_zoom_count = plan_face_zoom(
+        scenes_analysis, original_width, original_height,
+        face_fraction=args.face_zoom, max_upscale=args.face_zoom_max_upscale)
+    # After face zoom: widen toward nearby props and clear any face-zoom that
+    # would have cropped the screen/device back out of frame.
     if args.object_compose == 'auto':
         composed = plan_object_compose(scenes_analysis, original_width)
         if composed:
             print(f"   object-compose: widened {composed} TRACK scene(s) toward "
                   f"nearby screen/device")
-    face_zoom_count = plan_face_zoom(
-        scenes_analysis, original_width, original_height,
-        face_fraction=args.face_zoom, max_upscale=args.face_zoom_max_upscale)
     if args.follow_camera == 'auto':
         plan_follow_camera(
             scenes_analysis, original_width, original_height, fps)

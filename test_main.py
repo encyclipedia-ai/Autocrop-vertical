@@ -93,10 +93,23 @@ class CropModeTests(unittest.TestCase):
             "strategy": "TRACK",
             "target_box": [100, 20, 140, 70],
             "object_boxes": [[20, 30, 90, 80]],
+            "zoom_region": (110, 10, 40, 70),
         }]
         n = main.plan_object_compose(scenes, frame_width=200)
         self.assertEqual(n, 1)
         self.assertEqual(scenes[0]["target_box"], [20, 20, 140, 80])
+        # Face-zoom would have dropped the prop — clear it after compose.
+        self.assertNotIn("zoom_region", scenes[0])
+        self.assertTrue(scenes[0].get("object_composed"))
+
+    def test_fill_picks_largest_object_when_nobody_detected(self):
+        small = [10, 10, 30, 30]
+        large = [40, 20, 140, 90]
+        strategy, box = main.decide_cropping_strategy(
+            [], 90, crop_mode="auto", frame_width=200,
+            group_framing="fill", object_boxes=[small, large])
+        self.assertEqual(strategy, "TRACK")
+        self.assertEqual(box, large)
 
     def test_follow_camera_off_lets_speaker_turns_pan(self):
         # With face_boxes present, plan_pan_transitions used to skip pans
