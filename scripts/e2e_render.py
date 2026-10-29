@@ -143,8 +143,11 @@ def fake_analyze_for(scenes, head_r=HEAD_R):
     """Stand-in for YOLO: report the fixture's scripted people, if any."""
     def fake_analyze_scene_content(video_path, start, end, samples=1):
         _, _, _, people = scene_at(scenes, start.get_seconds() + 0.05)
-        return [{"person_box": person_box(cx, head_r), "face_box": None, "motion": 0.0}
-                for cx in people]
+        detections = [
+            {"person_box": person_box(cx, head_r), "face_box": None, "motion": 0.0}
+            for cx in people
+        ]
+        return detections, []
     return fake_analyze_scene_content
 
 

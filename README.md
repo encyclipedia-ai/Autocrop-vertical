@@ -324,6 +324,11 @@ This script is built on a pipeline that uses specialized libraries for each step
 
 ### Changelog
 
+#### v1.12.0 — Fill crop + object compose
+
+*   **`--group-framing fill|letterbox`** (default `fill`). When a multi-person group is too wide for 9:16, track the densest subject full-bleed instead of black letterbox bars. A lone detected screen/laptop/phone is tracked when nobody is in shot. Pass `letterbox` for the legacy bars.
+*   **`--object-compose auto|off`** (default `auto`). YOLO `tv` / `laptop` / `cell phone` boxes near the talker widen the TRACK target so IRL product demos keep the prop on screen with the face. Re-applied after speaker focus.
+
 #### v1.10.0 — Follow camera and edge overscan
 
 *   **Damped follow camera.** Speaker turns still decide who is framed. The crop now chases that face's per-frame box instead of holding the median for the whole turn: a few pixels of dead zone so detector jitter does not shimmer, and a max speed of one crop width per 0.7s so a speaker switch glides. Silence holds the last target. A real scene cut snaps. Boundary pans are no longer planned across face paths (`boundary_kind` `follow`); letterbox↔track zooms are unchanged.
