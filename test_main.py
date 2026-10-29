@@ -52,12 +52,64 @@ class CropModeTests(unittest.TestCase):
         self.assertEqual(strategy, "TRACK")
         self.assertEqual(box, [65, 15, 85, 40])  # face of second (more active)
 
-    def test_auto_letterboxes_when_group_is_too_wide(self):
+    def test_auto_fills_densest_subject_when_group_is_too_wide(self):
+        # Default group_framing='fill' tracks the densest subject instead of
+        # letterboxing a group that cannot fit in 9:16.
         strategy, box = main.decide_cropping_strategy(
             self._people(0.01, 0.02), 90, motion_threshold=0.5,
             crop_mode="auto", frame_width=160)
+        self.assertEqual(strategy, "TRACK")
+        self.assertEqual(box, [65, 15, 85, 40])  # face of second (more motion)
+
+    def test_letterbox_group_framing_preserves_legacy_bars(self):
+        strategy, box = main.decide_cropping_strategy(
+            self._people(0.01, 0.02), 90, motion_threshold=0.5,
+            crop_mode="auto", frame_width=160, group_framing="letterbox")
         self.assertEqual(strategy, "LETTERBOX")
         self.assertIsNone(box)
+
+    def test_compose_pulls_nearby_screen_into_target(self):
+        face = [100, 20, 140, 70]
+        screen = [20, 30, 90, 80]
+        composed = main.compose_target_with_objects(face, [screen], frame_width=200)
+        self.assertEqual(composed, [20, 20, 140, 80])
+
+    def test_compose_ignores_far_objects(self):
+        face = [10, 20, 40, 70]
+        far = [170, 20, 199, 70]
+        composed = main.compose_target_with_objects(face, [far], frame_width=200)
+        self.assertEqual(composed, face)
+
+    def test_fill_tracks_lone_object_when_nobody_detected(self):
+        screen = [40, 20, 120, 80]
+        strategy, box = main.decide_cropping_strategy(
+            [], 90, crop_mode="auto", frame_width=160,
+            group_framing="fill", object_boxes=[screen])
+        self.assertEqual(strategy, "TRACK")
+        self.assertEqual(box, screen)
+
+    def test_plan_object_compose_widens_speaker_face(self):
+        scenes = [{
+            "strategy": "TRACK",
+            "target_box": [100, 20, 140, 70],
+            "object_boxes": [[20, 30, 90, 80]],
+            "zoom_region": (110, 10, 40, 70),
+        }]
+        n = main.plan_object_compose(scenes, frame_width=200)
+        self.assertEqual(n, 1)
+        self.assertEqual(scenes[0]["target_box"], [20, 20, 140, 80])
+        # Face-zoom would have dropped the prop — clear it after compose.
+        self.assertNotIn("zoom_region", scenes[0])
+        self.assertTrue(scenes[0].get("object_composed"))
+
+    def test_fill_picks_largest_object_when_nobody_detected(self):
+        small = [10, 10, 30, 30]
+        large = [40, 20, 140, 90]
+        strategy, box = main.decide_cropping_strategy(
+            [], 90, crop_mode="auto", frame_width=200,
+            group_framing="fill", object_boxes=[small, large])
+        self.assertEqual(strategy, "TRACK")
+        self.assertEqual(box, large)
 
     def test_follow_camera_off_lets_speaker_turns_pan(self):
         # With face_boxes present, plan_pan_transitions used to skip pans

@@ -174,9 +174,13 @@ class SceneSplitting(unittest.TestCase):
         subs = speaker.split_scene_by_speaker(
             self.scene(), segs, self.tracks(), 720,
             lambda analysis, h: autocrop.decide_cropping_strategy(analysis, h))
-        self.assertEqual([s["strategy"] for s in subs], ["TRACK", "TRACK", "LETTERBOX"])
+        # Group segment uses decide_cropping_strategy defaults (group_framing=fill):
+        # two wide people cannot fit in 9:16, so fill tracks the densest subject
+        # instead of letterboxing.
+        self.assertEqual([s["strategy"] for s in subs], ["TRACK", "TRACK", "TRACK"])
         self.assertEqual(subs[0]["target_box"], [290, 160, 350, 220])
         self.assertEqual(subs[1]["target_box"], [930, 160, 990, 220])
+        self.assertEqual(subs[2]["target_box"], [220, 100, 420, 700])
         self.assertEqual([s.get("boundary_source") for s in subs],
                          [None, "speaker-turn", "speaker-turn"])
         self.assertAlmostEqual(subs[1]["start_seconds"], 3.0)
@@ -242,16 +246,18 @@ class SceneSplitting(unittest.TestCase):
         self.assertEqual(out[1]["boundary_source"], "speaker-turn")
 
     def test_lone_speaking_face_among_bystanders_is_tracked(self):
-        # YOLO saw 2 bodies -> LETTERBOX, but only one face exists and it talks.
+        # YOLO saw 2 bodies -> fill TRACK on densest body, but only one face
+        # exists and it talks — promote to that face (also covers legacy LETTERBOX).
         scene = self.scene()
-        scene["strategy"], scene["target_box"] = "LETTERBOX", None
+        scene["strategy"], scene["target_box"] = "TRACK", [860, 100, 1060, 700]
         track = self.tracks()[0]
         original = (speaker.track_faces, speaker.score_speaking)
         speaker.track_faces = lambda *a, **k: [track]
         speaker.score_speaking = lambda *a, **k: scores(240, t0=[(0, 200)])
         try:
             out, debug = speaker.apply_speaker_focus(
-                "unused.mp4", [scene], FPS, 720, lambda a, h: ("LETTERBOX", None),
+                "unused.mp4", [scene], FPS, 720,
+                lambda a, h: ("TRACK", [860, 100, 1060, 700]),
                 log=lambda *_: None)
         finally:
             speaker.track_faces, speaker.score_speaking = original

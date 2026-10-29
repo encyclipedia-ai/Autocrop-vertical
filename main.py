@@ -21,6 +21,17 @@ CAMERA_DEAD_ZONE_REF_HEIGHT = 1080.0
 # Seconds the camera takes to travel one crop width. A speaker switch glides
 # instead of snapping; a real scene cut still cuts.
 CAMERA_CROSS_SEC = 0.7
+# COCO class ids for interactive props (YOLOv8n). Used to pull a nearby
+# screen/device into the crop with the talker — IRL product demos otherwise
+# lock on the face and leave the subject of the joke off-frame.
+COCO_INTERACTIVE_OBJECTS = {
+    62: 'tv',
+    63: 'laptop',
+    67: 'cell phone',
+}
+# How far (as a fraction of frame width) an object may sit from the subject
+# and still be composed into the same crop.
+OBJECT_COMPOSE_MAX_GAP_FRAC = 0.45
 
 # Lazy-loaded models — initialized on first use so that importing the module
 # or running --help doesn't trigger heavyweight model loading.
@@ -58,15 +69,25 @@ def _iou(box_a, box_b):
 
 
 def _detect_people_in_frame(frame):
-    """Run YOLO + face cascade on a single frame, return a list of detections."""
+    """Run YOLO + face cascade; return (people, interactive_object_boxes).
+
+    People entries are `{person_box, face_box}`. Interactive objects are COCO
+    tv / laptop / cell-phone boxes used later to frame the talker with the
+    prop they are reacting to.
+    """
     import cv2
     results = get_yolo_model()([frame], verbose=False)
     detected = []
+    objects = []
     for result in results:
         for box in result.boxes:
-            if box.cls[0] != 0:
-                continue
+            cls_id = int(box.cls[0])
             x1, y1, x2, y2 = [int(i) for i in box.xyxy[0]]
+            if cls_id in COCO_INTERACTIVE_OBJECTS:
+                objects.append([x1, y1, x2, y2])
+                continue
+            if cls_id != 0:
+                continue
             person_box = [x1, y1, x2, y2]
             person_roi_gray = cv2.cvtColor(frame[y1:y2, x1:x2], cv2.COLOR_BGR2GRAY)
             faces = get_face_cascade().detectMultiScale(
@@ -76,12 +97,18 @@ def _detect_people_in_frame(frame):
                 fx, fy, fw, fh = faces[0]
                 face_box = [x1 + fx, y1 + fy, x1 + fx + fw, y1 + fy + fh]
             detected.append({'person_box': person_box, 'face_box': face_box})
-    return detected
+    return detected, objects
 
 
 def analyze_scene_content(video_path, scene_start_time, scene_end_time, samples=1):
     """
-    Analyzes one or more frames inside a scene to detect people and faces.
+    Analyzes one or more frames inside a scene to detect people, faces, and
+    interactive objects (tv / laptop / cell phone).
+
+    Returns:
+        (people, object_boxes) where people is a list of
+        `{person_box, face_box, motion}` and object_boxes is a deduped list of
+        `[x1, y1, x2, y2]` YOLO props.
 
     Args:
         samples: Number of evenly-spaced frames to sample from the scene.
@@ -93,7 +120,7 @@ def analyze_scene_content(video_path, scene_start_time, scene_end_time, samples=
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         print(f"Error: Could not open video {video_path}")
-        return []
+        return [], []
 
     start_frame = scene_start_time.get_frames()
     end_frame = scene_end_time.get_frames()
@@ -112,16 +139,19 @@ def analyze_scene_content(video_path, scene_start_time, scene_end_time, samples=
     # Run detection per sampled frame, keeping per-frame results so we can
     # track each person across samples and measure their motion.
     per_frame_detections = []
+    object_boxes = []
     for fn in frame_numbers:
         cap.set(cv2.CAP_PROP_POS_FRAMES, fn)
         ret, frame = cap.read()
         if not ret:
             continue
-        per_frame_detections.append(_detect_people_in_frame(frame))
+        people, objs = _detect_people_in_frame(frame)
+        per_frame_detections.append(people)
+        object_boxes.extend(objs)
     cap.release()
 
     if not per_frame_detections:
-        return []
+        return [], _stable_object_boxes(object_boxes)
 
     # Greedy IoU tracking: link detections across consecutive sampled frames
     # so we can build per-person trajectories.
@@ -177,11 +207,29 @@ def analyze_scene_content(video_path, scene_start_time, scene_end_time, samples=
             t['motion'] = total / avg_w
 
     # Strip tracking metadata down to the public shape; keep `motion`.
-    return [{
+    people = [{
         'person_box': t['person_box'],
         'face_box': t['face_box'],
         'motion': t['motion'],
     } for t in tracks]
+    return people, _stable_object_boxes(object_boxes)
+
+
+def _stable_object_boxes(boxes, iou_thresh=0.3):
+    """Deduplicate YOLO object boxes across scene samples via greedy IoU merge."""
+    if not boxes:
+        return []
+    kept = []
+    for box in boxes:
+        merged = False
+        for i, existing in enumerate(kept):
+            if _iou(box, existing) >= iou_thresh:
+                kept[i] = get_enclosing_box([existing, box])
+                merged = True
+                break
+        if not merged:
+            kept.append(list(box))
+    return kept
 
 
 def detect_scenes(video_path, downscale=0, frame_skip=0,
@@ -256,8 +304,63 @@ def center_crop_box(frame_width, frame_height):
     return 'TRACK', (x1, 0, x2, frame_height)
 
 
+def densest_track_target(scene_analysis):
+    """Person/face box to TRACK when a group is too wide for a 9:16 crop.
+
+    Prefers the most-moving body, then the largest face, then the largest
+    person box — a full-bleed fill crop beats black letterbox bars on Shorts.
+    """
+    if not scene_analysis:
+        return None
+
+    def face_area(obj):
+        fb = obj.get('face_box')
+        if not fb:
+            return 0
+        return max(0, fb[2] - fb[0]) * max(0, fb[3] - fb[1])
+
+    def person_area(obj):
+        pb = obj['person_box']
+        return max(0, pb[2] - pb[0]) * max(0, pb[3] - pb[1])
+
+    best = max(
+        scene_analysis,
+        key=lambda o: (o.get('motion', 0.0), face_area(o), person_area(o)),
+    )
+    return best.get('face_box') or best['person_box']
+
+
+def compose_target_with_objects(target_box, object_boxes, frame_width,
+                                max_gap_frac=OBJECT_COMPOSE_MAX_GAP_FRAC):
+    """Widen `target_box` to include a nearby interactive object when close.
+
+    Returns the original box when nothing is near enough. The TRACK crop only
+    uses the horizontal centre of this box, so composing face+screen pulls the
+    frame toward the prop without forcing letterbox.
+    """
+    if not target_box or not object_boxes or not frame_width:
+        return target_box
+    tx = (target_box[0] + target_box[2]) / 2.0
+    ty = (target_box[1] + target_box[3]) / 2.0
+    max_gap = max_gap_frac * float(frame_width)
+    best = None
+    best_dist = None
+    for ob in object_boxes:
+        ox = (ob[0] + ob[2]) / 2.0
+        oy = (ob[1] + ob[3]) / 2.0
+        dist = ((ox - tx) ** 2 + (oy - ty) ** 2) ** 0.5
+        if dist > max_gap:
+            continue
+        if best_dist is None or dist < best_dist:
+            best, best_dist = ob, dist
+    if best is None:
+        return target_box
+    return get_enclosing_box([target_box, best])
+
+
 def decide_cropping_strategy(scene_analysis, frame_height, motion_threshold=0.5,
-                             crop_mode='auto', frame_width=None):
+                             crop_mode='auto', frame_width=None,
+                             group_framing='fill', object_boxes=None):
     """Pick a cropping strategy for a scene.
 
     Args:
@@ -273,6 +376,11 @@ def decide_cropping_strategy(scene_analysis, frame_height, motion_threshold=0.5,
             person when present), 'wide' (always letterbox), or 'center'
             (fixed center crop; requires frame_width).
         frame_width: source frame width; required when crop_mode is 'center'.
+        group_framing: when a multi-person group is too wide for 9:16, 'fill'
+            (default) tracks the densest subject full-bleed; 'letterbox' keeps
+            the legacy full-frame bars. Also used when nobody is detected but
+            an interactive object (screen/laptop/phone) is present.
+        object_boxes: optional interactive-object boxes from scene analysis.
     """
     if crop_mode == 'wide':
         return 'LETTERBOX', None
@@ -282,13 +390,24 @@ def decide_cropping_strategy(scene_analysis, frame_height, motion_threshold=0.5,
         return center_crop_box(frame_width, frame_height)
 
     effective_threshold = 0.0 if crop_mode == 'subject' else motion_threshold
+    object_boxes = object_boxes or []
 
     num_people = len(scene_analysis)
     if num_people == 0:
+        # Prefer a full-bleed crop on a detected screen/device over black bars.
+        # Pick the largest prop (usually the in-shot display); enclosing every
+        # distant phone/TV would recreate the too-wide letterbox problem.
+        if group_framing == 'fill' and object_boxes:
+            best = max(
+                object_boxes,
+                key=lambda b: max(0, b[2] - b[0]) * max(0, b[3] - b[1]),
+            )
+            return 'TRACK', best
         return 'LETTERBOX', None
     if num_people == 1:
         target_box = scene_analysis[0]['face_box'] or scene_analysis[0]['person_box']
-        return 'TRACK', target_box
+        return 'TRACK', compose_target_with_objects(
+            target_box, object_boxes, frame_width)
 
     # Multiple people: if one is clearly more active than the others, focus
     # on them rather than averaging the whole group.
@@ -298,17 +417,46 @@ def decide_cropping_strategy(scene_analysis, frame_height, motion_threshold=0.5,
         idx = motions.index(max_motion)
         target = scene_analysis[idx]
         target_box = target['face_box'] or target['person_box']
-        return 'TRACK', target_box
+        return 'TRACK', compose_target_with_objects(
+            target_box, object_boxes, frame_width)
 
-    # Otherwise, fall back to enclosing the group (or letterboxing if too wide).
+    # Otherwise, fall back to enclosing the group — or, when that is too wide
+    # for 9:16, fill-crop the densest subject instead of letterboxing.
     person_boxes = [obj['person_box'] for obj in scene_analysis]
     group_box = get_enclosing_box(person_boxes)
     group_width = group_box[2] - group_box[0]
     max_width_for_crop = frame_height * ASPECT_RATIO
     if group_width < max_width_for_crop:
-        return 'TRACK', group_box
-    else:
-        return 'LETTERBOX', None
+        return 'TRACK', compose_target_with_objects(
+            group_box, object_boxes, frame_width)
+    if group_framing == 'fill':
+        return 'TRACK', compose_target_with_objects(
+            densest_track_target(scene_analysis), object_boxes, frame_width)
+    return 'LETTERBOX', None
+
+
+def plan_object_compose(scenes_analysis, frame_width):
+    """Re-compose TRACK targets with interactive objects after speaker focus.
+
+    Speaker focus may replace `target_box` with a face; this pass pulls a
+    nearby screen/laptop/phone back into the frame. When a face-zoom region
+    was already planned, clear it — a tight face crop would drop the prop.
+    """
+    count = 0
+    for scene in scenes_analysis:
+        if scene.get('strategy') != 'TRACK':
+            continue
+        objects = scene.get('object_boxes') or []
+        if not objects:
+            continue
+        before = scene.get('target_box')
+        after = compose_target_with_objects(before, objects, frame_width)
+        if after is not None and after != before:
+            scene['target_box'] = after
+            scene.pop('zoom_region', None)
+            scene['object_composed'] = True
+            count += 1
+    return count
 
 def place_axis(center, crop_size, frame_size, max_black_fraction=MAX_BLACK_FRACTION):
     """Origin of a window of `crop_size` centered on `center`.
@@ -1492,6 +1640,18 @@ def cli():
                              "person when one is present; 'wide' always letterboxes the "
                              "full frame; 'center' uses a fixed center crop with no "
                              "subject tracking. 'wide' and 'center' disable speaker focus.")
+    parser.add_argument('--group-framing', type=str, default='fill',
+                        choices=['fill', 'letterbox'],
+                        help="When a multi-person group is too wide for the output "
+                             "aspect, 'fill' (default) tracks the densest subject "
+                             "full-bleed instead of black bars; 'letterbox' keeps the "
+                             "legacy wide-frame letterbox. Also frames a lone detected "
+                             "screen/laptop/phone when nobody is in shot.")
+    parser.add_argument('--object-compose', type=str, default='auto',
+                        choices=['auto', 'off'],
+                        help="When 'auto' (default), pull a nearby YOLO tv/laptop/"
+                             "cell-phone into the TRACK crop with the talker so IRL "
+                             "product demos keep the prop on screen. 'off' disables.")
     parser.add_argument('--follow-camera', type=str, default='auto',
                         choices=['auto', 'off'],
                         help="Per-frame face chase after speaker focus. 'auto' (default) "
@@ -1716,17 +1876,21 @@ def cli():
 
     scenes_analysis = []
     for i, (start_time, end_time) in enumerate(tqdm(scenes, desc="Analyzing Scenes")):
-        analysis = analyze_scene_content(input_video, start_time, end_time,
-                                         samples=args.analysis_samples)
+        analysis, object_boxes = analyze_scene_content(
+            input_video, start_time, end_time, samples=args.analysis_samples)
+        if args.object_compose != 'auto':
+            object_boxes = []
         strategy, target_box = decide_cropping_strategy(
             analysis, original_height, motion_threshold=args.motion_threshold,
-            crop_mode=args.crop_mode, frame_width=original_width)
+            crop_mode=args.crop_mode, frame_width=original_width,
+            group_framing=args.group_framing, object_boxes=object_boxes)
         scenes_analysis.append({
             'start_frame': start_time.get_frames(),
             'end_frame': end_time.get_frames(),
             'start_seconds': start_time.get_seconds(),
             'end_seconds': end_time.get_seconds(),
             'analysis': analysis,
+            'object_boxes': object_boxes,
             'strategy': strategy,
             'target_box': target_box
         })
@@ -1736,10 +1900,12 @@ def cli():
         args.speaker_focus == 'auto' and args.crop_mode in ('auto', 'subject'))
     if speaker_focus_enabled:
         import speaker
-        def decide(analysis, height):
+        def decide(analysis, height, object_boxes=None):
             return decide_cropping_strategy(
                 analysis, height, motion_threshold=args.motion_threshold,
-                crop_mode=args.crop_mode, frame_width=original_width)
+                crop_mode=args.crop_mode, frame_width=original_width,
+                group_framing=args.group_framing,
+                object_boxes=object_boxes or [])
         scenes_analysis, speaker_debug = speaker.apply_speaker_focus(
             input_video, scenes_analysis, fps, original_height, decide,
             min_dwell_sec=args.speaker_min_dwell,
@@ -1749,6 +1915,13 @@ def cli():
     face_zoom_count = plan_face_zoom(
         scenes_analysis, original_width, original_height,
         face_fraction=args.face_zoom, max_upscale=args.face_zoom_max_upscale)
+    # After face zoom: widen toward nearby props and clear any face-zoom that
+    # would have cropped the screen/device back out of frame.
+    if args.object_compose == 'auto':
+        composed = plan_object_compose(scenes_analysis, original_width)
+        if composed:
+            print(f"   object-compose: widened {composed} TRACK scene(s) toward "
+                  f"nearby screen/device")
     if args.follow_camera == 'auto':
         plan_follow_camera(
             scenes_analysis, original_width, original_height, fps)

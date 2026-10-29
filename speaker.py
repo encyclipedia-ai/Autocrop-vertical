@@ -487,9 +487,10 @@ def apply_speaker_focus(video_path, scenes_analysis, fps, frame_height,
             continue
         tracks = track_faces(video_path, scene["start_frame"], scene["end_frame"],
                              fps, face_stride=face_stride)
-        if len(tracks) == 1 and scene.get("strategy") == "LETTERBOX":
+        if len(tracks) == 1 and people >= 2:
             # Several bodies (audience, bystanders) but one face: if that face
-            # is doing the talking, frame it instead of letterboxing everyone.
+            # is doing the talking, frame it. Covers both legacy LETTERBOX and
+            # fill-crop TRACK (which otherwise locks onto the densest body).
             scores = score_speaking(video_path, scene, tracks, fps, log=log)
             track = tracks[0]
             fraction = _speaking_fraction(scores, track, scene["start_frame"]) if scores else None
