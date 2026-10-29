@@ -460,6 +460,9 @@ def run_speaker(out_dir, args):
         # 'group' so the fixture exercises the widen/narrow (zoom) path too;
         # the production default 'loudest' is covered by unit tests.
         "--speaker-overlap", "group",
+        # Crosstalk widen needs letterbox; fill (the v1.12 default) would
+        # TRACK the densest subject instead and skip zoom-out/zoom-in.
+        "--group-framing", "letterbox",
         "--debug-overlay", str(overlay),
     ])
     summary = plan["summary"]
