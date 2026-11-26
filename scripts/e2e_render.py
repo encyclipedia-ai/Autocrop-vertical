@@ -179,22 +179,38 @@ fake_score_speaking = fake_score_for(SPEAKER_SCRIPT)
 
 
 def measure_visible_height(path):
-    """Per output frame: source rows visible (from the red row gradient)."""
+    """Per output frame: source rows on screen, from the red row gradient.
+
+    The gradient is read from a background band at the left of the frame
+    (people sit on W/4 and 3W/4) and fitted through the middle of the
+    content. A median across that band ignores the fixture's 1px grid.
+    The fast x264 preset flattens the first and last rows into wide
+    constant steps, so sampling those rows reports a shorter crop than the
+    one that was encoded (a 360px face zoom was measuring 344). Extending
+    the middle slope across the content height is the span actually shown.
+    """
     cap = cv2.VideoCapture(str(path))
     heights = []
     while True:
         ok, frame = cap.read()
         if not ok:
             break
-        h, w = frame.shape[:2]
-        # Sample a background band near the left edge (people are centred on
-        # W/4 and 3W/4, far from the crop's left edge), a few rows in from the
-        # top/bottom to dodge codec ringing. The median over a 40px-wide band
-        # ignores the fixture's 1px grid lines when a pan edge crosses one.
-        top = float(np.median(frame[4:10, 2:42, 2]))
-        bottom = float(np.median(frame[h - 10:h - 4, 2:42, 2]))
-        to_row = lambda code: (code - 40) * (H - 1) / 215  # noqa: E731
-        heights.append(int(round(to_row(bottom) - to_row(top))))
+        content = np.where(frame.max(axis=2).max(axis=1) > 20)[0]
+        if content.size < 10:
+            heights.append(0)
+            continue
+        y_lo = int(content[0])
+        y_hi = int(content[-1])
+        band_h = y_hi - y_lo + 1
+        profile = np.median(frame[:, 2:42, 2].astype(np.float64), axis=1)
+        margin = max(4, band_h // 5)
+        fit_lo = y_lo + margin
+        fit_hi = y_hi - margin
+        if fit_hi - fit_lo < 8:
+            fit_lo, fit_hi = y_lo, y_hi
+        ys = np.arange(fit_lo, fit_hi + 1, dtype=np.float64)
+        slope = np.polyfit(ys, profile[fit_lo:fit_hi + 1], 1)[0]
+        heights.append(int(round(slope * band_h * (H - 1) / 215)))
     cap.release()
     return heights
 
