@@ -1163,40 +1163,67 @@ def same_size_runs(regions):
     return runs
 
 
-def _snap_crop_sizes(regions, step):
-    """Snap width and height onto `step`, keeping each crop's center."""
-    snapped = []
-    for x, y, width, height in regions:
-        cx = x + width / 2.0
-        cy = y + height / 2.0
-        snapped_w = max(step, int(round(width / step)) * step)
-        snapped_h = max(step, int(round(height / step)) * step)
-        snapped.append((
-            int(round(cx - snapped_w / 2.0)),
-            int(round(cy - snapped_h / 2.0)),
-            snapped_w,
-            snapped_h,
-        ))
-    return snapped
+def _with_size(region, width, height):
+    """Same center, new crop size."""
+    x, y, old_w, old_h = region
+    cx = x + old_w / 2.0
+    cy = y + old_h / 2.0
+    return (
+        int(round(cx - width / 2.0)),
+        int(round(cy - height / 2.0)),
+        int(width),
+        int(height),
+    )
 
 
-def limit_crop_runs(regions, max_runs=MAX_CROP_RUNS):
+def limit_crop_runs(regions, max_runs=None):
     """Coarsen a zoom's crop sizes until ffmpeg can encode them as few branches.
 
-    A plan already within `max_runs` is returned unchanged. Otherwise width
-    and height snap onto a coarser grid, doubling the step until the stretch
-    count fits or the step reaches 512. Centers stay where they were.
+    A plan already within `max_runs` is returned unchanged. Otherwise the
+    shortest adjacent stretches are folded together, closest sizes first, and
+    a long hold keeps its size. A zoom still starts and ends on the crops it
+    was planned to, and each frame keeps its center.
     """
-    if len(same_size_runs(regions)) <= max_runs:
+    if max_runs is None:
+        max_runs = MAX_CROP_RUNS
+    regions = [tuple(region) for region in regions]
+    runs = same_size_runs(regions)
+    if len(runs) <= max_runs:
         return regions
-    step = 4
-    snapped = regions
-    while step <= 512:
-        snapped = _snap_crop_sizes(regions, step)
-        if len(same_size_runs(snapped)) <= max_runs:
-            return snapped
-        step *= 2
-    return snapped
+    while len(runs) > max_runs and len(runs) > 1:
+        best = 0
+        best_rank = None
+        for index in range(len(runs) - 1):
+            left, right = runs[index], runs[index + 1]
+            left_len = left["end"] - left["start"]
+            right_len = right["end"] - right["start"]
+            width_l, height_l = left["size"]
+            width_r, height_r = right["size"]
+            rank = (
+                min(left_len, right_len),
+                max(left_len, right_len),
+                abs(width_l - width_r) + abs(height_l - height_r),
+                index,
+            )
+            if best_rank is None or rank < best_rank:
+                best = index
+                best_rank = rank
+        left, right = runs[best], runs[best + 1]
+        left_len = left["end"] - left["start"]
+        right_len = right["end"] - right["start"]
+        size = left["size"] if left_len >= right_len else right["size"]
+        runs[best] = {"size": size, "start": left["start"], "end": right["end"]}
+        del runs[best + 1]
+    limited = []
+    for run in runs:
+        width, height = run["size"]
+        for index in range(run["start"], run["end"]):
+            region = regions[index]
+            if (int(region[2]), int(region[3])) == (width, height):
+                limited.append(region)
+            else:
+                limited.append(_with_size(region, width, height))
+    return limited
 
 
 def output_scale_filters(crop_w, crop_h, out_w, out_h):

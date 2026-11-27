@@ -1044,6 +1044,25 @@ class CropRunLimitTests(unittest.TestCase):
         regions = [(0, 0, 100, 200), (4, 0, 100, 200), (0, 0, 80, 160)]
         self.assertEqual(main.limit_crop_runs(regions), regions)
 
+    def test_a_zoom_keeps_the_crop_it_leaves_and_lands_on(self):
+        start = (0, 0, 400, 720)
+        end = (80, 40, 220, 400)
+        regions = [start] * 5
+        for step in range(1, 30):
+            t = step / 30
+            regions.append((
+                int(round(80 * t)),
+                int(round(40 * t)),
+                int(round(400 + (220 - 400) * t)),
+                int(round(720 + (400 - 720) * t)),
+            ))
+        regions += [end] * 5
+        self.assertGreater(len(main.same_size_runs(regions)), main.MAX_CROP_RUNS)
+        limited = main.limit_crop_runs(regions)
+        self.assertLessEqual(len(main.same_size_runs(limited)), main.MAX_CROP_RUNS)
+        self.assertEqual(limited[:5], [start] * 5)
+        self.assertEqual(limited[-5:], [end] * 5)
+
     def test_a_per_frame_zoom_collapses_under_the_cap(self):
         regions = [(0, 0, 200, 400 + i) for i in range(40)]
         self.assertGreater(len(main.same_size_runs(regions)), main.MAX_CROP_RUNS)
