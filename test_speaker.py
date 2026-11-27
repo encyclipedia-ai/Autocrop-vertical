@@ -272,6 +272,37 @@ class SceneSplitting(unittest.TestCase):
         self.assertEqual(out[0]["speaker"], {"kind": "unsplit", "reason": "no-scorer", "tracks": 2})
         self.assertEqual(debug[0]["start_frame"], 0)
 
+    def test_a_crowd_is_scored_on_the_longest_faces_only(self):
+        scene = self.scene()
+        tracks = [
+            {"id": index, "boxes": {n: [0, 0, 1, 1] for n in range(frames)}}
+            for index, frames in enumerate([5, 100, 9, 80, 8, 70, 7, 60])
+        ]
+        seen = []
+        original = (speaker.track_faces, speaker.score_speaking)
+        speaker.track_faces = lambda *a, **k: tracks
+
+        def capture(_video, _scene, scored, _fps, log=None):
+            seen.append([track["id"] for track in scored])
+            return None
+
+        speaker.score_speaking = capture
+        try:
+            speaker.apply_speaker_focus(
+                "unused.mp4", [scene], FPS, 720,
+                lambda analysis, h: autocrop.decide_cropping_strategy(analysis, h),
+                log=lambda *_: None)
+        finally:
+            speaker.track_faces, speaker.score_speaking = original
+        self.assertEqual(seen, [[1, 3, 5, 7, 2, 4]])
+
+    def test_fewer_faces_than_the_cap_are_all_scored(self):
+        kept = speaker.tracks_worth_scoring([
+            {"id": 0, "boxes": {1: [0, 0, 1, 1]}},
+            {"id": 1, "boxes": {1: [0, 0, 1, 1], 2: [0, 0, 1, 1]}},
+        ])
+        self.assertEqual([track["id"] for track in kept], [0, 1])
+
     def test_apply_speaker_focus_with_scorer_splits(self):
         scene = self.scene()
         original = (speaker.track_faces, speaker.score_speaking)

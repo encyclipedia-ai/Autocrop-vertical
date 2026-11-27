@@ -248,6 +248,27 @@ def median_box(track, start_frame, end_frame):
 
 SILENCE_RMS = 0.002  # below this (of full scale) nobody can be "speaking"
 
+# Each scored track reruns the speaker model over the scene. A panel fits
+# under this; a crowd of brief faces does not, and the person talking is
+# one of the faces that stays in frame. Job 8f1e scored 36 tracks for seven
+# minutes and still kept a single crop.
+MAX_SCORED_FACE_TRACKS = 6
+
+
+def tracks_worth_scoring(tracks, limit=MAX_SCORED_FACE_TRACKS):
+    """The faces on screen the longest, up to `limit`.
+
+    Fewer tracks than `limit` are returned unchanged. `limit <= 0` keeps
+    every track.
+    """
+    if not tracks or limit is None or limit <= 0 or len(tracks) <= limit:
+        return list(tracks)
+    ranked = sorted(
+        tracks,
+        key=lambda track: (-len(track.get("boxes") or {}), track.get("id", 0)),
+    )
+    return ranked[:limit]
+
 
 def score_speaking(video_path, scene, tracks, fps, log=None):
     """Per-track P(speaking) per frame from Light-ASD (see asd.py).
@@ -623,6 +644,11 @@ def apply_speaker_focus(video_path, scenes_analysis, fps, frame_height,
             debug[idx] = {"tracks": tracks, "scores": None, "segments": None,
                           "start_frame": span[0]}
             continue
+        tracked = len(tracks)
+        tracks = tracks_worth_scoring(tracks)
+        if len(tracks) < tracked:
+            log(f"   speaker-focus: scene {idx + 1} scoring {len(tracks)} of "
+                f"{tracked} face tracks, the ones on screen longest")
         scores = score_speaking(video_path, scene, tracks, fps, log=log)
         if not scores:
             log(f"   speaker-focus: scene {idx + 1} tracked {len(tracks)} faces "
