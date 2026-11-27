@@ -144,6 +144,48 @@ class FaceTracking(unittest.TestCase):
             self.assertEqual(max(track["boxes"]), 88)
         self.assertEqual(speaker.median_box(tracks[1], 30, 90), [200, 20, 240, 60])
 
+    def test_face_stride_follows_the_frame_rate(self):
+        # 2 is the step at 30 fps. Faster clips step further, slower keep it.
+        self.assertEqual(speaker.face_detect_stride(30, 2), 2)
+        self.assertEqual(speaker.face_detect_stride(29.97, 2), 2)
+        self.assertEqual(speaker.face_detect_stride(24, 2), 2)
+        self.assertEqual(speaker.face_detect_stride(50, 2), 3)
+        self.assertEqual(speaker.face_detect_stride(60, 2), 4)
+        self.assertEqual(speaker.face_detect_stride(59.94, 2), 4)
+        self.assertEqual(speaker.face_detect_stride(60, 1), 2)
+        self.assertEqual(speaker.face_detect_stride(60, 0), 2)
+        self.assertEqual(speaker.face_detect_stride(0, 2), 2)
+
+    def test_a_60fps_scene_is_detected_as_often_per_second_as_30fps(self):
+        import cv2
+        fps = 60
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "clip.mp4")
+            writer = cv2.VideoWriter(path, cv2.VideoWriter_fourcc(*"mp4v"), fps, (320, 180))
+            for _ in range(120):
+                writer.write(np.zeros((180, 320, 3), np.uint8))
+            writer.release()
+            calls = []
+
+            def fake_detect(frame):
+                calls.append(len(calls))
+                return [[20, 20, 60, 60]]
+
+            tracks = speaker.track_faces(path, 0, 120, fps, face_stride=2,
+                                         detect=fake_detect)
+        self.assertEqual(len(calls), 30)  # 2 s at 15 detections per second
+        self.assertEqual(len(tracks), 1)
+        # Frames between detections are still filled in.
+        self.assertEqual(sorted(tracks[0]["boxes"]), list(range(0, 117)))
+
+    def test_a_scene_too_short_for_any_track_is_not_read(self):
+        def fail(frame):
+            raise AssertionError("no face detection should run")
+
+        # 15 frames at 30 fps is 0.5 s; a track has to last 0.6 s to be kept.
+        tracks = speaker.track_faces("missing.mp4", 100, 115, FPS, detect=fail)
+        self.assertEqual(tracks, [])
+
 
 class SceneSplitting(unittest.TestCase):
     def scene(self):

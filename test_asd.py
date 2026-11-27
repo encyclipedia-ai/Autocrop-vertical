@@ -50,6 +50,27 @@ class ScoreTrackCrops(unittest.TestCase):
         self.assertEqual(len(probs), 90)
         self.assertTrue(np.all(probs == 0.0))
 
+    def test_only_the_sampled_frames_are_looked_up(self):
+        class Recording(dict):
+            def __init__(self):
+                super().__init__()
+                self.asked = []
+
+            def get(self, key, default=None):
+                self.asked.append(key)
+                return default
+
+        for fps, start, end in ((60, 120, 420), (30, 90, 240), (25, 0, 50), (59.94, 7, 300)):
+            crops = Recording()
+            asd.score_track_crops(FakeModel(), np.zeros((2000, 13)), crops, start, end, fps)
+            self.assertEqual(crops.asked, asd.visual_sample_frames(start, end, fps))
+        # At 60 fps the model reads 25 of every 60 frames.
+        sampled = asd.visual_sample_frames(0, 600, 60)
+        self.assertEqual(len(sampled), 250)
+        self.assertEqual(len(set(sampled)), 250)
+        self.assertTrue(all(0 <= n < 600 for n in sampled))
+        self.assertEqual(asd.visual_sample_frames(10, 10, 30), [])
+
     def test_short_mfcc_is_padded(self):
         crops = {n: np.full((112, 112), 255, np.uint8) for n in range(60)}
         probs = asd.score_track_crops(FakeModel(), np.zeros((50, 13)), crops, 0, 60, 30)

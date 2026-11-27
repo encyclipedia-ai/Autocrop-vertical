@@ -166,6 +166,22 @@ def interpolate_track(track, start_frame, end_frame):
     return track
 
 
+FACE_STRIDE_FPS = 30.0  # the frame rate --speaker-face-stride is written for
+
+
+def face_detect_stride(fps, face_stride=2):
+    """Frames between face detections.
+
+    `face_stride` is the step at 30 fps. A faster clip steps further so its
+    faces are still found as often per second: 2 at 30 fps is 4 at 60 fps.
+    Slower clips keep `face_stride` as it is.
+    """
+    base = max(1, int(face_stride))
+    if not fps or fps <= FACE_STRIDE_FPS:
+        return base
+    return max(base, int(round(base * fps / FACE_STRIDE_FPS)))
+
+
 def track_faces(video_path, start_frame, end_frame, fps, face_stride=2,
                 max_gap_sec=0.5, min_track_sec=0.6, detect=None):
     """Detect and track faces across one scene.
@@ -178,16 +194,24 @@ def track_faces(video_path, start_frame, end_frame, fps, face_stride=2,
     detect = detect or detect_faces
     max_gap = max(1, int(round(max_gap_sec * fps)))
     min_len = max(1, int(round(min_track_sec * fps)))
+    if end_frame - start_frame < min_len:
+        # No track can last min_track_sec in a scene this short, so every
+        # one would be dropped below. Skip the seek and the detections.
+        return []
+    stride = face_detect_stride(fps, face_stride)
     cap = cv2.VideoCapture(video_path)
     cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
     tracks = []
     n = start_frame
     while n < end_frame:
-        ok, frame = cap.read()
-        if not ok:
-            break
-        if (n - start_frame) % max(1, face_stride) == 0:
+        if (n - start_frame) % stride == 0:
+            ok, frame = cap.read()
+            if not ok:
+                break
             associate_tracks(tracks, detect(frame), n, max_gap)
+        elif not cap.grab():
+            # A skipped frame is decoded but never converted to an image.
+            break
         n += 1
     cap.release()
     kept = []
@@ -250,22 +274,26 @@ def score_speaking(video_path, scene, tracks, fps, log=None):
     model = asd.get_model()
     mfcc = asd.mfcc_features(audio)
 
+    # The model reads faces at 25 fps. Only those source frames need a crop;
+    # at 60 fps that is fewer than half of them.
+    wanted = set(asd.visual_sample_frames(start, end, fps))
     crops = {t["id"]: {} for t in tracks}
     cap = cv2.VideoCapture(video_path)
     cap.set(cv2.CAP_PROP_POS_FRAMES, start)
     n = start
     while n < end:
+        present = [t for t in tracks if n in t["boxes"]] if n in wanted else []
+        if not present:
+            if not cap.grab():
+                break
+            n += 1
+            continue
         ok, frame = cap.read()
         if not ok:
             break
-        gray = None
-        for track in tracks:
-            box = track["boxes"].get(n)
-            if box is None:
-                continue
-            if gray is None:
-                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            crops[track["id"]][n] = asd.crop_face(gray, box)
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        for track in present:
+            crops[track["id"]][n] = asd.crop_face(gray, track["boxes"][n])
         n += 1
     cap.release()
 

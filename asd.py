@@ -276,24 +276,39 @@ def crop_face(frame_gray, box, crop_scale=CROP_SCALE):
     return face[56:168, 56:168]
 
 
+def visual_sample_frames(start_frame, end_frame, fps):
+    """Source frames the model reads for [start_frame, end_frame).
+
+    One per 25 fps step, in order. These are the only frames
+    `score_track_crops` looks up, so a caller needs crops for no others.
+    """
+    length = end_frame - start_frame
+    if length < 1 or not fps:
+        return []
+    n_visual = int(round(length / fps * VISUAL_FPS))
+    return [start_frame + min(length - 1, int(round(k * fps / VISUAL_FPS)))
+            for k in range(n_visual)]
+
+
 def score_track_crops(model, mfcc, crops_by_frame, start_frame, end_frame, fps):
     """Score one face track.
 
-    crops_by_frame: {source frame -> 112x112 uint8}. Frames of the scene the
-    track does not cover get a neutral grey crop (the model then leans on
-    audio alone, which reads as "not this face"). Returns per-source-frame
-    P(speaking) over [start_frame, end_frame).
+    crops_by_frame: {source frame -> 112x112 uint8}, needed only for the
+    frames in `visual_sample_frames`. Frames of the scene the track does not
+    cover get a neutral grey crop (the model then leans on audio alone, which
+    reads as "not this face"). Returns per-source-frame P(speaking) over
+    [start_frame, end_frame).
     """
     length = end_frame - start_frame
     duration = length / fps
-    n_visual = int(round(duration * VISUAL_FPS))
+    sampled = visual_sample_frames(start_frame, end_frame, fps)
+    n_visual = len(sampled)
     n_audio = int(round(duration * MFCC_HZ))
     if n_visual < 1:
         return np.zeros(length)
     neutral = np.full((112, 112), 110, dtype=np.uint8)
     faces = np.empty((n_visual, 112, 112), dtype=np.uint8)
-    for k in range(n_visual):
-        src = start_frame + min(length - 1, int(round(k * fps / VISUAL_FPS)))
+    for k, src in enumerate(sampled):
         faces[k] = crops_by_frame.get(src, neutral)
     if mfcc.shape[0] < n_audio:
         mfcc = np.pad(mfcc, ((0, n_audio - mfcc.shape[0]), (0, 0)), "edge")
