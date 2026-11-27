@@ -983,5 +983,13 @@ class FfmpegCropCommandTests(unittest.TestCase):
                 self.assertLess(red, index * 30 + 12, f"frame {index} red {red}")
 
 
+class ChildExitTests(unittest.TestCase):
+    def test_describe_exit_names_a_kill_and_a_normal_code(self):
+        self.assertEqual(main.describe_exit("ffmpeg", 1), "ffmpeg exited with code 1")
+        self.assertIn("SIGKILL", main.describe_exit("ffmpeg", -9))
+        self.assertIn("out of memory", main.describe_exit("ffmpeg", -9))
+        self.assertNotIn("out of memory", main.describe_exit("ffmpeg", -15))
+
+
 if __name__ == "__main__":
     unittest.main()

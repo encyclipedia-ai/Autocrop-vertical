@@ -1301,6 +1301,19 @@ def run_ffmpeg_encode(
     return returncode, "".join(stderr_lines)
 
 
+def describe_exit(program, returncode):
+    """One line saying how a child process ended."""
+    if returncode < 0:
+        import signal
+        try:
+            name = signal.Signals(-returncode).name
+        except ValueError:
+            name = f"signal {-returncode}"
+        hint = " (the system may be out of memory)" if name == "SIGKILL" else ""
+        return f"{program} was killed by {name}{hint}"
+    return f"{program} exited with code {returncode}"
+
+
 def readable_frame_count(video_path):
     """How many frames ffmpeg will decode.
 
@@ -2062,6 +2075,9 @@ def cli():
     if returncode != 0:
         print("\n❌ FFmpeg frame processing failed.")
         print("Stderr:", stderr_output)
+        # Last, so it is the line a caller reports. A killed ffmpeg prints
+        # no error of its own and the output ends on the encoder banner.
+        print(describe_exit("ffmpeg", returncode))
         cleanup_temp_files()
         sys.exit(1)
     step_end_time = time.time()
