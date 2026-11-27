@@ -983,6 +983,19 @@ class FfmpegCropCommandTests(unittest.TestCase):
                 self.assertLess(red, index * 30 + 12, f"frame {index} red {red}")
 
 
+class FocusRangeTests(unittest.TestCase):
+    def test_bounds_follow_the_frame_rate(self):
+        self.assertEqual(main.focus_frame_bounds(None, None, 30), (None, None))
+        self.assertEqual(main.focus_frame_bounds(8, 30, 30), (240, 900))
+        self.assertEqual(main.focus_frame_bounds(8, None, 60), (480, None))
+        self.assertEqual(main.focus_frame_bounds(None, 2.5, 30), (None, 75))
+
+    def test_an_empty_range_analyses_the_whole_file(self):
+        self.assertEqual(main.focus_frame_bounds(10, 10, 30), (None, None))
+        self.assertEqual(main.focus_frame_bounds(12, 4, 30), (None, None))
+        self.assertEqual(main.focus_frame_bounds(1, 2, 0), (None, None))
+
+
 class ChildExitTests(unittest.TestCase):
     def test_describe_exit_names_a_kill_and_a_normal_code(self):
         self.assertEqual(main.describe_exit("ffmpeg", 1), "ffmpeg exited with code 1")

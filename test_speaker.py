@@ -356,6 +356,84 @@ class SceneSplitting(unittest.TestCase):
         self.assertEqual(out[0]["focus_face"], [300, 160, 360, 220])
         self.assertEqual(debug, {})
 
+    def test_a_scene_outside_the_focus_range_is_not_tracked(self):
+        early = self.scene()
+        early["end_frame"] = 60
+        early["end_seconds"] = 2.0
+        play = self.scene()
+        play["start_frame"] = 90
+        play["end_frame"] = 210
+        play["start_seconds"] = 3.0
+        play["end_seconds"] = 7.0
+        calls = []
+
+        def fake_track(*args, **_kwargs):
+            calls.append((args[1], args[2]))
+            return self.tracks()
+
+        original = speaker.track_faces
+        speaker.track_faces = fake_track
+        try:
+            out, _ = speaker.apply_speaker_focus(
+                "unused.mp4", [early, play], FPS, 720,
+                lambda a, h: ("LETTERBOX", None),
+                log=lambda *_: None,
+                focus_start_frame=90, focus_end_frame=210)
+        finally:
+            speaker.track_faces = original
+        self.assertEqual(out[0]["speaker"]["reason"], "outside-focus")
+        self.assertEqual(out[0]["end_frame"], 60)
+        self.assertEqual(calls, [(90, 210)])
+
+    def test_handles_hold_the_crop_from_the_play_range(self):
+        scene = self.scene()
+        seen = {}
+
+        def fake_track(_path, start, end, *_args, **_kwargs):
+            seen["span"] = (start, end)
+            boxes = {n: [290 + (0 if n < start + 60 else 640), 160,
+                         350 + (0 if n < start + 60 else 640), 220]
+                     for n in range(start, end)}
+            return [
+                {"id": 0, "first": start, "last": start + 59, "boxes": {
+                    n: boxes[n] for n in range(start, start + 60)}},
+                {"id": 1, "first": start + 60, "last": end - 1, "boxes": {
+                    n: boxes[n] for n in range(start + 60, end)}},
+            ]
+
+        def fake_score(_path, scored, _tracks, _fps, log=None):
+            seen["scored"] = (scored["start_frame"], scored["end_frame"],
+                              scored["start_seconds"], scored["end_seconds"])
+            length = scored["end_frame"] - scored["start_frame"]
+            return scores(length, t0=[(0, length // 2)], t1=[(length // 2, length)])
+
+        original = (speaker.track_faces, speaker.score_speaking)
+        speaker.track_faces = fake_track
+        speaker.score_speaking = fake_score
+        try:
+            out, debug = speaker.apply_speaker_focus(
+                "unused.mp4", [scene], FPS, 720,
+                lambda a, h: ("LETTERBOX", None),
+                min_dwell_sec=1.0, log=lambda *_: None,
+                focus_start_frame=90, focus_end_frame=210)
+        finally:
+            speaker.track_faces, speaker.score_speaking = original
+        self.assertEqual(seen["span"], (90, 210))
+        self.assertEqual(seen["scored"][:2], (90, 210))
+        self.assertAlmostEqual(seen["scored"][2], 3.0)
+        self.assertAlmostEqual(seen["scored"][3], 7.0)
+        self.assertEqual(out[0]["start_frame"], 0)
+        self.assertAlmostEqual(out[0]["start_seconds"], 0.0)
+        self.assertEqual(out[-1]["end_frame"], 240)
+        self.assertAlmostEqual(out[-1]["end_seconds"], 8.0)
+        self.assertNotIn(0, out[0]["face_boxes"])
+        self.assertIn(90, out[0]["face_boxes"])
+        self.assertEqual(debug[0]["start_frame"], 90)
+        autocrop.plan_follow_camera(out, 1280, 720, FPS)
+        # The 3 s before the play range holds the first framed face.
+        self.assertEqual(out[0]["follow_regions"][0], out[0]["follow_regions"][90])
+        self.assertEqual(out[-1]["follow_regions"][239], out[-1]["follow_regions"][209])
+
 
 class Timecode(unittest.TestCase):
     def test_format_matches_pyscenedetect(self):

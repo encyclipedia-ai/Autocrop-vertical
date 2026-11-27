@@ -487,16 +487,83 @@ def _speaking_fraction(scores, track, start_frame, on_threshold=0.5):
     return float(np.mean(probs[present] >= on_threshold))
 
 
+def focus_span(scene, focus_start_frame, focus_end_frame):
+    """Frames of `scene` inside [focus_start, focus_end), or None if it misses.
+
+    A missing bound is open. Both missing means the whole scene.
+    """
+    start, end = scene["start_frame"], scene["end_frame"]
+    lo = start if focus_start_frame is None else max(start, int(focus_start_frame))
+    hi = end if focus_end_frame is None else min(end, int(focus_end_frame))
+    if hi - lo < 1:
+        return None
+    return lo, hi
+
+
+def slice_scene(scene, start_frame, end_frame):
+    """Scene covering [start_frame, end_frame), times mapped from `scene`.
+
+    The same object comes back when the scene is already that range, so a
+    caller that analyses the whole file still mutates the original scene.
+    """
+    if start_frame == scene["start_frame"] and end_frame == scene["end_frame"]:
+        return scene
+    span = max(1, scene["end_frame"] - scene["start_frame"])
+    dur = scene["end_seconds"] - scene["start_seconds"]
+    sliced = dict(scene)
+    sliced["start_frame"] = start_frame
+    sliced["end_frame"] = end_frame
+    sliced["start_seconds"] = scene["start_seconds"] + (
+        (start_frame - scene["start_frame"]) * dur / span)
+    sliced["end_seconds"] = scene["start_seconds"] + (
+        (end_frame - scene["start_frame"]) * dur / span)
+    return sliced
+
+
+def cover_scene(subs, scene):
+    """Stretch the first and last sub-scene out to `scene`'s full span.
+
+    Speaker work may have run on the middle of the scene. Frames outside
+    that middle keep the nearest crop: the camera holds the closest face it
+    stored, and a group segment keeps its scene-level framing.
+    """
+    if not subs:
+        return subs
+    subs[0]["start_frame"] = scene["start_frame"]
+    subs[0]["start_seconds"] = scene["start_seconds"]
+    subs[-1]["end_frame"] = scene["end_frame"]
+    subs[-1]["end_seconds"] = scene["end_seconds"]
+    return subs
+
+
 def apply_speaker_focus(video_path, scenes_analysis, fps, frame_height,
                         decide_strategy, min_dwell_sec=1.2, face_stride=2,
-                        overlap="loudest", zoom_faces=True, log=print):
+                        overlap="loudest", zoom_faces=True, log=print,
+                        focus_start_frame=None, focus_end_frame=None):
     """Run tracking + scoring on multi-person scenes and split them by speaker.
 
     Returns (new_scenes_analysis, debug) where debug maps original scene
     index -> {tracks, scores, segments} for the overlay renderer.
+
+    `focus_start_frame` / `focus_end_frame` limit the frames that are tracked
+    and scored. Scenes that miss the range keep their scene-level framing.
+    Scenes that overlap it are analysed on the overlap, then stretched back
+    so the frames outside hold the nearest crop.
     """
     out, debug = [], {}
-    for idx, scene in enumerate(scenes_analysis):
+    if focus_start_frame is not None or focus_end_frame is not None:
+        log(f"   speaker-focus: tracking frames "
+            f"{focus_start_frame if focus_start_frame is not None else 'start'}"
+            f"..{focus_end_frame if focus_end_frame is not None else 'end'}")
+    for idx, full in enumerate(scenes_analysis):
+        span = focus_span(full, focus_start_frame, focus_end_frame)
+        if span is None:
+            log(f"   speaker-focus: scene {idx + 1} is outside the focus range; "
+                f"keeping scene-level framing")
+            full["speaker"] = {"kind": "unsplit", "reason": "outside-focus"}
+            out.append(full)
+            continue
+        scene = slice_scene(full, span[0], span[1])
         people = len(scene.get("analysis") or [])
         if people < 2:
             if people == 1 and scene.get("strategy") == "TRACK":
@@ -511,6 +578,7 @@ def apply_speaker_focus(video_path, scenes_analysis, fps, frame_height,
                     if zoom_faces:
                         scene["focus_face"] = median_box(
                             tracks[0], scene["start_frame"], scene["end_frame"])
+            cover_scene([scene], full)
             out.append(scene)
             continue
         tracks = track_faces(video_path, scene["start_frame"], scene["end_frame"],
@@ -543,24 +611,27 @@ def apply_speaker_focus(video_path, scenes_analysis, fps, frame_height,
                                     "detail": why}
                 log(f"   speaker-focus: scene {idx + 1} has {people} people but one face "
                     f"track ({why}); keeping scene-level framing")
+            cover_scene([scene], full)
             out.append(scene)
             continue
         if len(tracks) < 2:
             log(f"   speaker-focus: scene {idx + 1} has {people} people but "
                 f"{len(tracks)} face track(s); keeping scene-level framing")
             scene["speaker"] = {"kind": "unsplit", "reason": "faces", "tracks": len(tracks)}
+            cover_scene([scene], full)
             out.append(scene)
             debug[idx] = {"tracks": tracks, "scores": None, "segments": None,
-                          "start_frame": scene["start_frame"]}
+                          "start_frame": span[0]}
             continue
         scores = score_speaking(video_path, scene, tracks, fps, log=log)
         if not scores:
             log(f"   speaker-focus: scene {idx + 1} tracked {len(tracks)} faces "
                 f"but could not score speakers; keeping scene-level framing")
             scene["speaker"] = {"kind": "unsplit", "reason": "no-scorer", "tracks": len(tracks)}
+            cover_scene([scene], full)
             out.append(scene)
             debug[idx] = {"tracks": tracks, "scores": None, "segments": None,
-                          "start_frame": scene["start_frame"]}
+                          "start_frame": span[0]}
             continue
         segments = segment_speaker_turns(scores, scene["start_frame"],
                                          scene["end_frame"], fps,
@@ -570,9 +641,10 @@ def apply_speaker_focus(video_path, scenes_analysis, fps, frame_height,
                                       decide_strategy, scores=scores)
         log(f"   speaker-focus: scene {idx + 1} -> {len(subs)} segment(s) from "
             f"{len(tracks)} face track(s)")
+        cover_scene(subs, full)
         out.extend(subs)
         debug[idx] = {"tracks": tracks, "scores": scores, "segments": segments,
-                      "start_frame": scene["start_frame"]}
+                      "start_frame": span[0]}
     return out, debug
 
 
