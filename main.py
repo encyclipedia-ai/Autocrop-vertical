@@ -285,6 +285,32 @@ def detect_scenes(video_path, downscale=0, frame_skip=0,
     video_manager.release()
     return scene_list, fps
 
+
+def merge_short_scenes(scenes, min_sec):
+    """Fold scenes shorter than `min_sec` into a neighbor.
+
+    Each short scene extends the scene before it. A short scene at the start,
+    which has nothing before it, extends forward through the following scenes
+    until the span reaches `min_sec`. `min_sec <= 0` keeps the detector output.
+    The pairs are the `(start, end)` timecodes PySceneDetect returns.
+    """
+    if not scenes or not min_sec or min_sec <= 0:
+        return list(scenes)
+    kept = []
+    for start, end in scenes:
+        duration = end.get_seconds() - start.get_seconds()
+        if not kept:
+            kept.append((start, end))
+            continue
+        previous_start, previous_end = kept[-1]
+        previous_duration = previous_end.get_seconds() - previous_start.get_seconds()
+        if duration < min_sec or previous_duration < min_sec:
+            kept[-1] = (previous_start, end)
+            continue
+        kept.append((start, end))
+    return kept
+
+
 def get_enclosing_box(boxes):
     if not boxes:
         return None
@@ -1115,6 +1141,11 @@ def crop_sendcmd(regions, fps, pad_x, pad_y):
     return "\n".join(lines) + "\n"
 
 
+# One ffmpeg branch per crop size. A per-frame zoom past this opens enough
+# branches to exhaust the worker (a clip with 93 sizes was killed for memory).
+MAX_CROP_RUNS = 16
+
+
 def same_size_runs(regions):
     """Consecutive frames whose crop width and height stay constant.
 
@@ -1130,6 +1161,42 @@ def same_size_runs(regions):
         else:
             runs.append({"size": size, "start": index, "end": index + 1})
     return runs
+
+
+def _snap_crop_sizes(regions, step):
+    """Snap width and height onto `step`, keeping each crop's center."""
+    snapped = []
+    for x, y, width, height in regions:
+        cx = x + width / 2.0
+        cy = y + height / 2.0
+        snapped_w = max(step, int(round(width / step)) * step)
+        snapped_h = max(step, int(round(height / step)) * step)
+        snapped.append((
+            int(round(cx - snapped_w / 2.0)),
+            int(round(cy - snapped_h / 2.0)),
+            snapped_w,
+            snapped_h,
+        ))
+    return snapped
+
+
+def limit_crop_runs(regions, max_runs=MAX_CROP_RUNS):
+    """Coarsen a zoom's crop sizes until ffmpeg can encode them as few branches.
+
+    A plan already within `max_runs` is returned unchanged. Otherwise width
+    and height snap onto a coarser grid, doubling the step until the stretch
+    count fits or the step reaches 512. Centers stay where they were.
+    """
+    if len(same_size_runs(regions)) <= max_runs:
+        return regions
+    step = 4
+    snapped = regions
+    while step <= 512:
+        snapped = _snap_crop_sizes(regions, step)
+        if len(same_size_runs(snapped)) <= max_runs:
+            return snapped
+        step *= 2
+    return snapped
 
 
 def output_scale_filters(crop_w, crop_h, out_w, out_h):
@@ -1249,6 +1316,7 @@ def run_ffmpeg_encode(
     """Encode the planned crops in ffmpeg. Returns (returncode, stderr)."""
     import threading
 
+    regions = limit_crop_runs(regions)
     graph = build_encode_graph(
         regions, fps, frame_width, frame_height,
         output_width, output_height, sendcmd_path,
@@ -1718,6 +1786,11 @@ def cli():
                              "(PySceneDetect default); LOWER values (e.g. 15-20) detect more "
                              "subtle cuts (dialogue, talk shows, similar lighting). "
                              "For --scene-detector adaptive, default is 3.0.")
+    parser.add_argument('--min-scene-sec', type=float, default=1.0,
+                        help="Fold a detected scene shorter than this many seconds "
+                             "into a neighbor before content analysis (default 1). "
+                             "0 keeps every detected cut. A sub-second cut still "
+                             "costs a full scene analysis of its own.")
     parser.add_argument('--min-scene-len', type=int, default=15,
                         help="Minimum scene length in frames (default 15). Lower this to "
                              "catch very fast cuts (montages, action edits).")
@@ -1889,7 +1962,12 @@ def cli():
         threshold=scene_threshold,
         min_scene_len=args.min_scene_len,
     )
+    detected = len(scenes)
+    scenes = merge_short_scenes(scenes, args.min_scene_sec)
     step_end_time = time.time()
+    if len(scenes) != detected:
+        print(f"   {detected - len(scenes)} scenes under {args.min_scene_sec:.1f}s "
+              f"folded into their neighbors ({len(scenes)} remain)")
     
     if not scenes:
         # Only reachable for an unreadable/empty video now that detect_scenes

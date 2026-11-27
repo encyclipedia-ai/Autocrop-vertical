@@ -1004,5 +1004,55 @@ class ChildExitTests(unittest.TestCase):
         self.assertNotIn("out of memory", main.describe_exit("ffmpeg", -15))
 
 
+class ShortSceneTests(unittest.TestCase):
+    def span(self, start, end):
+        class Mark:
+            def __init__(self, sec):
+                self.sec = sec
+
+            def get_seconds(self):
+                return self.sec
+
+        return (Mark(start), Mark(end))
+
+    def test_sub_second_scenes_fold_into_a_neighbor(self):
+        scenes = [
+            self.span(0, 0.4),
+            self.span(0.4, 5),
+            self.span(5, 5.4),
+            self.span(5.4, 9),
+        ]
+        merged = main.merge_short_scenes(scenes, 1.0)
+        self.assertEqual(
+            [(s.get_seconds(), e.get_seconds()) for s, e in merged],
+            [(0, 5.4), (5.4, 9)],
+        )
+
+    def test_long_scenes_stay_separate(self):
+        scenes = [self.span(0, 2), self.span(2, 5)]
+        merged = main.merge_short_scenes(scenes, 1.0)
+        self.assertEqual(len(merged), 2)
+        self.assertIs(merged[0][1], scenes[0][1])
+
+    def test_zero_minimum_keeps_every_cut(self):
+        scenes = [self.span(0, 0.2), self.span(0.2, 0.4)]
+        self.assertEqual(len(main.merge_short_scenes(scenes, 0)), 2)
+
+
+class CropRunLimitTests(unittest.TestCase):
+    def test_a_plan_within_the_cap_is_unchanged(self):
+        regions = [(0, 0, 100, 200), (4, 0, 100, 200), (0, 0, 80, 160)]
+        self.assertEqual(main.limit_crop_runs(regions), regions)
+
+    def test_a_per_frame_zoom_collapses_under_the_cap(self):
+        regions = [(0, 0, 200, 400 + i) for i in range(40)]
+        self.assertGreater(len(main.same_size_runs(regions)), main.MAX_CROP_RUNS)
+        limited = main.limit_crop_runs(regions)
+        self.assertLessEqual(len(main.same_size_runs(limited)), main.MAX_CROP_RUNS)
+        x, y, width, height = limited[0]
+        self.assertAlmostEqual(x + width / 2, 100, delta=1)
+        self.assertAlmostEqual(y + height / 2, 200, delta=1)
+
+
 if __name__ == "__main__":
     unittest.main()
