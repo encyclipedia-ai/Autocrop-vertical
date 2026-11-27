@@ -1301,6 +1301,25 @@ def run_ffmpeg_encode(
     return returncode, "".join(stderr_lines)
 
 
+def focus_frame_bounds(start_sec, end_sec, fps):
+    """Frame bounds for --focus-start/--focus-end, or (None, None).
+
+    An inverted or empty range is ignored. Analysing nothing would drop
+    speaker framing for the whole file because of a bad argument.
+    """
+    if start_sec is None and end_sec is None:
+        return None, None
+    if not fps or fps <= 0:
+        return None, None
+    start = None if start_sec is None else max(0, int(round(float(start_sec) * fps)))
+    end = None if end_sec is None else max(0, int(round(float(end_sec) * fps)))
+    if start is not None and end is not None and end <= start:
+        print(f"   speaker-focus: focus range {start_sec}->{end_sec}s is empty; "
+              f"analysing the whole file")
+        return None, None
+    return start, end
+
+
 def describe_exit(program, returncode):
     """One line saying how a child process ended."""
     if returncode < 0:
@@ -1742,6 +1761,16 @@ def cli():
     parser.add_argument('--speaker-face-stride', type=int, default=2,
                         help="Run face detection every N frames when tracking speakers "
                              "(default 2). Higher = cheaper, coarser tracks.")
+    parser.add_argument('--focus-start', type=float, default=None,
+                        help="Seconds into the file where the play range starts. "
+                             "Speaker tracking and scoring run only inside "
+                             "[--focus-start, --focus-end). Frames outside keep "
+                             "the nearest crop, so a padded handle holds the "
+                             "first or last speaker instead of being analysed. "
+                             "Omit both to analyse the whole file.")
+    parser.add_argument('--focus-end', type=float, default=None,
+                        help="Seconds into the file where the play range ends. "
+                             "See --focus-start.")
     parser.add_argument('--face-zoom', type=float, default=0.18,
                         help="Tighten the crop on small faces so the face is about this "
                              "fraction of the output height (default 0.18; 0 disables). "
@@ -1919,12 +1948,16 @@ def cli():
                 crop_mode=args.crop_mode, frame_width=original_width,
                 group_framing=args.group_framing,
                 object_boxes=object_boxes or [])
+        focus_start_frame, focus_end_frame = focus_frame_bounds(
+            args.focus_start, args.focus_end, fps)
         scenes_analysis, speaker_debug = speaker.apply_speaker_focus(
             input_video, scenes_analysis, fps, original_height, decide,
             min_dwell_sec=args.speaker_min_dwell,
             face_stride=args.speaker_face_stride,
             overlap=args.speaker_overlap,
-            zoom_faces=args.face_zoom > 0)
+            zoom_faces=args.face_zoom > 0,
+            focus_start_frame=focus_start_frame,
+            focus_end_frame=focus_end_frame)
     face_zoom_count = plan_face_zoom(
         scenes_analysis, original_width, original_height,
         face_fraction=args.face_zoom, max_upscale=args.face_zoom_max_upscale)
